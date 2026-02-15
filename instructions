@@ -1,0 +1,12 @@
+qemu-system-i386 -kernel microkernel.bin -m 2G -hda ntfs.img -netdev user,id=n0 -device rtl8139,netdev=n0
+
+
+
+qemu-system-i386 -kernel microkernel.bin -m 2G -hda ntfs.img -hdb disk.img -netdev user,id=n0 -device rtl8139,netdev=n0 -initrd build/hello.elf 
+
+qemu-system-i386 -kernel microkernel.bin -m 2G -device VGA -hda ntfs.img -hdb disk.img -netdev user,id=n0 -device rtl8139,netdev=n0 -serial stdio -initrd build/hello.elf 2>&1 | tee output.log
+
+qemu-system-i386 -kernel microkernel.bin -m 2G   -device virtio-gpu-gl-pci -display gtk,gl=on   -device virtio-tablet-pci   -hda ntfs.img -hdb disk.img   -netdev user,id=n0 -device rtl8139,netdev=n0   -serial stdio -initrd build/hello.elf 2>&1 | tee output.log
+
+
+
