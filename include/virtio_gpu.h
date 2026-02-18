@@ -210,4 +210,9 @@ void virtio_gpu_flush_all(void);
 /* Disable / clean up the GPU */
 void virtio_gpu_disable(void);
 
+bool virtio_gpu_send_cmd_2iov(const void *hdr, uint32_t hdr_len,
+                              const void *data, uint32_t data_len,
+                              void *resp, uint32_t resp_len);
+
+
 #endif

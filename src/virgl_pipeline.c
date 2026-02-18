@@ -267,7 +267,7 @@ static uint32_t create_dsa_state(bool depth_test, bool depth_write) {
  *     word N+0: src_offset
  *     word N+1: instance_divisor
  *     word N+2: vertex_buffer_index
- *     word N+3: src_format (VIRGL_FORMAT_*)
+ *     word N+3: src_format (PIPE_FORMAT_*)
  *
  *   Number of elements = (payload_len - 1) / 4
  *
@@ -287,13 +287,13 @@ static uint32_t create_vertex_elements(void) {
     emit(0);                           /* src_offset = 0 bytes */
     emit(0);                           /* instance_divisor = 0 */
     emit(0);                           /* vertex_buffer_index = 0 */
-    emit(VIRGL_FORMAT_R32G32B32_FLOAT); /* format */
+    emit(PIPE_FORMAT_R32G32B32_FLOAT); /* format */
 
     /* Element 1: color (vec4 at offset 12) */
     emit(12);                            /* src_offset = 12 bytes (after 3 floats) */
     emit(0);                             /* instance_divisor = 0 */
     emit(0);                             /* vertex_buffer_index = 0 */
-    emit(VIRGL_FORMAT_R32G32B32A32_FLOAT); /* format */
+    emit(PIPE_FORMAT_R32G32B32A32_FLOAT); /* format */
 
     serial_printf("virgl_pipeline: created vertex elements handle=%u (%u elements)\n",
                   handle, num_elements);
@@ -308,7 +308,7 @@ static uint32_t create_vertex_elements(void) {
  * Wire format (from vrend_decode_create_surface):
  *   word 0: handle
  *   word 1: resource_id
- *   word 2: format (VIRGL_FORMAT_*)
+ *   word 2: format (PIPE_FORMAT_*)
  *   word 3: val0 — for textures: level; for buffers: first_element
  *   word 4: val1 — for textures: (first_layer) | (last_layer << 16);
  *                   for buffers: last_element

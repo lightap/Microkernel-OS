@@ -12,40 +12,103 @@
 
 
 
+/* Minimal virgl protocol bits we need (avoid pulling virgl_protocol.h) */
 
-#define VS_NUM_TOKENS 10
+/* Shader "offlen" field:
+ *  - First packet: store FULL shader length in BYTES (low 31 bits), CONT bit clear
+ *  - Continuation packet: store OFFSET in BYTES (low 31 bits), CONT bit set
+ */
+#define VIRGL_OBJ_SHADER_OFFSET_CONT        (1u << 31)
+#define VIRGL_OBJ_SHADER_OFFSET_VAL(x_dwords) ((uint32_t)(x_dwords) & 0x7FFFFFFFu)
+#define VIRGL_OBJ_SHADER_OFFSET_VAL_BYTES(x_bytes) ((uint32_t)(x_bytes) & 0x7FFFFFFFu)
 
-#define FS_NUM_TOKENS 10
-static const uint32_t vs_tokens[10] = {
-    0x00001102,               
-    0x00000001,               // ✅ VERTEX = 1
-    0x000F2000, 0x00000000,   
-    0x000F2020, 0x00000000,   
-    0x00000002,               
-    0x000000F0,               
-    0x00000F00,               
-    0x0000000E                
+
+static const uint8_t vs_bin[] __attribute__((aligned(4)))  = {  0x02, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x23, 0x30, 0x01, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x20, 0x20, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x30, 0x30, 0x2f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x20, 0x40, 0x0f, 0x01, 0x00, 0x00, 0x00, 0x00, 0x51, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x22, 0x10, 0xa0, 0x00, 0xc4, 0x00, 0x00, 0x00,
+  0x07, 0x00, 0x40, 0x11, 0x22, 0x10, 0xa0, 0x00, 0x34, 0x00, 0x00, 0x00,
+  0x02, 0x00, 0x00, 0x01, 0x22, 0x10, 0xa0, 0x00, 0xf3, 0x00, 0x00, 0x00,
+  0x04, 0x00, 0x00, 0x39, 0x02, 0x50, 0x07, 0x00
+};
+static const uint8_t fs_bin[] __attribute__((aligned(4)))  = {   0x02, 0x0e, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x23, 0x50, 0x00, 0x00,
+  0x01, 0x00, 0x00, 0x00, 0x30, 0x30, 0x2f, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x01, 0x00, 0x00, 0x00, 0x51, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x3f,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x22, 0x10, 0xa0, 0x00, 0xf3, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x01,
+  0x02, 0x50, 0x07, 0x00
+ };
+
+
+#define VS_BIN_LEN ((uint32_t)sizeof(vs_bin))
+#define FS_BIN_LEN ((uint32_t)sizeof(fs_bin))
+
+
+ static inline const uint32_t* as_u32(const uint8_t* p) { return (const uint32_t*)p; }
+static inline uint32_t dwords(uint32_t bytes) { return bytes / 4; }
+
+
+
+
+// Valid Vertex Shader Tokens (Position + Color)
+// VERT / DCL IN[0],POSITION / DCL IN[1],GENERIC[0]
+// DCL OUT[0],POSITION / DCL OUT[1],GENERIC[0]
+// MOV OUT[0],IN[0] / MOV OUT[1],IN[1] / END
+// Raw TGSI tokens for vertex shader (21 tokens)
+static const uint32_t vs_tokens_binary[] = {
+ // 0x00001802,
+  0x00180202, 
+    0x00000000,
+    0x00013023,
+    0x00000000,
+    0x000F2020,
+    0x00000000,
+    0x002F3030,
+    0x00000000,
+    0x00000000,
+    0x010F4020,
+    0x00000000,
+    0x00000051,
+    0x00000000,
+    0x3F800000,
+    0x00000000,
+    0x00000000,
+    0x00a01022,
+    0x000000C4,
+    0x11400007,
+    0x00A01022,
+    0x00000034,
+    0x01000002,
+    0x00A01022,
+    0x000000F3,
+    0x39000004,
+    0x00075002,
 };
 
-static const uint32_t fs_tokens[10] = {
-    0x00001102,
-    0x00000000,               // ✅ FRAGMENT = 0
-    0x000F2000, 0x00000000,   
-    0x00010001, 0x00000000,   
-    0x00000002,               
-    0x000000F0, 0x000000F0,   
-    0x0000000E                
-};
 
 
-// Define the header structure so the compiler knows its size
-struct virtio_gpu_ctrl_hdr {
-    uint32_t type;
-    uint32_t flags;
-    uint64_t fence_id;
-    uint32_t ctx_id;
-    uint32_t padding;
+static const uint32_t fs_tokens_binary[] = {
+   // 0x00000E02,
+     0x000E0202,
+    0x00000001,
+    0x00005023,
+    0x00000001,
+    0x002F3030,
+    0x00000000,
+    0x00000001,
+    0x00000051,
+    0x3F800000,
+    0x00000000,
+    0x00000000,
+    0x00000000,
+    0x00A01022,
+    0x000000F3,
+    0x01000007,
+    0x00075002,
 };
+
 
 /*
  * Virgl 3D Driver — GPU-accelerated rendering
@@ -223,7 +286,7 @@ bool virgl_create_resource_3d(uint32_t res_id, uint32_t target,
     memset(&cmd, 0, sizeof(cmd));
 
     cmd.hdr.type   = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D;
-    cmd.hdr.ctx_id = vctx.ctx_id;
+    cmd.hdr.ctx_id = 0;   /* <--- MUST BE 0 (Global) */
 
     cmd.resource_id = res_id;
     cmd.target      = target;
@@ -242,7 +305,7 @@ bool virgl_create_resource_3d(uint32_t res_id, uint32_t target,
 
     serial_printf("virgl: CREATE_3D res=%u target=%u fmt=%u bind=%x %ux%u sizeof=%u (expect 72)\n",
                   res_id, target, fmt, bind, width, height, sizeof(cmd));
-
+serial_printf("CREATE_3D DEBUG: res=%u format=%u\n", res_id, cmd.format);
     bool ok = gpu3d_cmd_ok(&cmd, sizeof(cmd));
     if (!ok) {
         serial_printf("virgl: CREATE_3D FAILED for res=%u\n", res_id);
@@ -280,7 +343,7 @@ static bool virgl_attach_backing(uint32_t res_id, uint32_t phys, uint32_t size) 
 
     memset(&cmd, 0, sizeof(cmd));
     cmd.hdr.hdr.type = VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING;
-    cmd.hdr.hdr.ctx_id = vctx.ctx_id;
+    cmd.hdr.hdr.ctx_id = 0;
     cmd.hdr.resource_id = res_id;
     cmd.hdr.nr_entries = 1;
     cmd.entry.addr = (uint64_t)phys;
@@ -288,43 +351,130 @@ static bool virgl_attach_backing(uint32_t res_id, uint32_t phys, uint32_t size) 
 
     return gpu3d_cmd_ok(&cmd, sizeof(cmd));
 }
-/* ===== Submit 3D Command Buffer (VIRTIO_GPU_CMD_SUBMIT_3D) ===== */
+/* ============================================================
+ * Debug dump (no %08x, no serial_putc)
+ * ============================================================ */
+/* ============================================================
+ * Debug dump (no serial_putc needed)
+ * ============================================================ */
+#define VIRGL_DEBUG_DUMP 1
+#define VIRGL_DEBUG_DUMP_MAX_WORDS 512
+
+static void virgl_cmd_dump(uint32_t nwords)
+{
+#if VIRGL_DEBUG_DUMP
+    if (nwords > VIRGL_DEBUG_DUMP_MAX_WORDS) nwords = VIRGL_DEBUG_DUMP_MAX_WORDS;
+
+    serial_printf("CMD_DUMP: %u words:\n", nwords);
+    for (uint32_t i = 0; i < nwords; i++) {
+        /* IMPORTANT:
+         * Your serial_printf("%x") already prints "0x........" in your logs.
+         * So DO NOT add "0x" in the format string or you get "0x0x....".
+         */
+        serial_printf("  [%u] %x\n", i, vctx.cmd_buf[i]);
+    }
+#else
+    (void)nwords;
+#endif
+}
+
+/* ============================================================
+ * SUBMIT_3D helper (SIZE MUST BE BYTES)
+ * ============================================================ */
 static bool virgl_submit_cmd_buf(uint32_t *cmds, uint32_t size_bytes)
 {
-    /* virtio_gpu_cmd_submit is 24(hdr) + 4(size in BYTES) + 4(pad) = 32 */
-    const uint32_t header_size = 32;
-    const uint32_t total_size  = header_size + size_bytes;
+    if (!cmds) return false;
+    if (size_bytes == 0) return true;
 
-    uint8_t *buf = (uint8_t *)v3d_cmd_buf;
-    memset(buf, 0, header_size);
+    /* SUBMIT_3D payload should be dword-aligned */
+    if (size_bytes & 3u) {
+        serial_printf("virgl: submit_3d size not 4-byte aligned: %u\n", size_bytes);
+        return false;
+    }
 
-    virtio_gpu_ctrl_hdr_t *hdr = (virtio_gpu_ctrl_hdr_t *)buf;
-    hdr->type   = VIRTIO_GPU_CMD_SUBMIT_3D;
-    hdr->ctx_id = vctx.ctx_id;
+    virtio_gpu_cmd_submit_3d_t *s = (virtio_gpu_cmd_submit_3d_t *)v3d_cmd_buf;
+    const uint32_t total_bytes = (uint32_t)sizeof(*s) + size_bytes;
 
-    /* size is BYTES */
-    *(uint32_t *)(buf + 24) = size_bytes;
+    /* Make sure the staging buffer can hold header + command stream */
+    if (total_bytes > (uint32_t)sizeof(v3d_cmd_buf)) {
+        serial_printf("virgl: submit_3d overflow total=%u (hdr=%u + payload=%u) buf=%u\n",
+                      total_bytes, (uint32_t)sizeof(*s), size_bytes, (uint32_t)sizeof(v3d_cmd_buf));
+        return false;
+    }
 
-    /* pad at +28 remains 0 */
-    memcpy(buf + 32, cmds, size_bytes);
+    memset(s, 0, sizeof(*s));
+    s->hdr.type   = VIRTIO_GPU_CMD_SUBMIT_3D;
+    s->hdr.ctx_id = vctx.ctx_id;
+    s->size       = size_bytes; /* BYTES */
+
+    uint8_t *dst = (uint8_t *)v3d_cmd_buf + sizeof(*s);
+
+    /*
+     * IMPORTANT: cmds might alias v3d_cmd_buf (depending on how you allocated vctx.cmd_buf).
+     * memmove is safe for overlap; memcpy is not.
+     */
+    memmove(dst, cmds, size_bytes);
 
     memset(v3d_resp_buf, 0, sizeof(virtio_gpu_ctrl_hdr_t));
 
     int head = virtio_send(virgl_dev, VIRTIO_GPU_QUEUE_CONTROL,
-                           (uint32_t)v3d_cmd_buf, total_size,
+                           (uint32_t)v3d_cmd_buf, total_bytes,
                            (uint32_t)v3d_resp_buf, sizeof(virtio_gpu_ctrl_hdr_t));
-    if (head < 0) return false;
+    if (head < 0) {
+        serial_printf("virgl: virtio_send submit_3d failed head=%d total_bytes=%u\n",
+                      head, total_bytes);
+        return false;
+    }
 
     virtio_notify(virgl_dev, VIRTIO_GPU_QUEUE_CONTROL);
     virtio_wait(virgl_dev, VIRTIO_GPU_QUEUE_CONTROL);
 
     virtio_gpu_ctrl_hdr_t *resp = (virtio_gpu_ctrl_hdr_t *)v3d_resp_buf;
     if (resp->type >= VIRTIO_GPU_RESP_ERR_UNSPEC) {
-        serial_printf("virgl: submission failed with error 0x%x\n", resp->type);
+        serial_printf("virgl: submit_3d failed resp.type=%x ctx=%u size_bytes=%u total=%u\n",
+                      resp->type, vctx.ctx_id, size_bytes, total_bytes);
         return false;
     }
+
     return true;
 }
+
+
+
+bool virgl_cmd_submit(void)
+{
+    if (!vctx.initialized) return false;
+    if (vctx.cmd_pos == 0) return true;
+
+    /* cmd_pos is in dwords */
+    uint32_t size_bytes = vctx.cmd_pos * 4;
+
+    /* Safety: don't overflow the cmd buffer */
+    if (size_bytes > vctx.cmd_buf_size) {
+        serial_printf("virgl_cmd_submit: size overflow (bytes=%u > buf=%u) cmd_pos=%u\n",
+                      size_bytes, vctx.cmd_buf_size, vctx.cmd_pos);
+        return false;
+    }
+
+    /* Optional but useful: dump exactly what we are about to submit */
+    virgl_cmd_dump(vctx.cmd_pos);
+
+    /*
+     * IMPORTANT: SUBMIT_3D size is BYTES (not dwords).
+     * virgl_submit_cmd_buf() must send ONLY 'size_bytes' of command data.
+     */
+    if (!virgl_submit_cmd_buf(vctx.cmd_buf, size_bytes)) {
+        serial_printf("virgl_cmd_submit: SUBMIT_3D failed (bytes=%u words=%u)\n",
+                      size_bytes, vctx.cmd_pos);
+        return false;
+    }
+
+    return true;
+}
+
+
+
+
 
 
 
@@ -343,13 +493,19 @@ bool virgl_init(void) {
     serial_printf("virgl: initializing 3D support...\n");
 
     /* Verify struct sizes match QEMU expectations */
-    serial_printf("virgl: struct sizes: ctrl_hdr=%u(24) ctx_create=%u(96) "
-                  "res_create_3d=%u(72) ctx_resource=%u(32) cmd_submit=%u(28)\n",
-                  sizeof(virtio_gpu_ctrl_hdr_t),
-                  sizeof(virtio_gpu_ctx_create_t),
-                  sizeof(virtio_gpu_resource_create_3d_t),
-                  sizeof(virtio_gpu_ctx_resource_t),
-                  sizeof(virtio_gpu_cmd_submit_t));
+serial_printf("virgl: struct sizes: ctrl_hdr=%u(24) ctx_create=%u(96) "
+              "res_create_3d=%u(72) ctx_resource=%u(32) submit3d=%u(32)\n",
+              sizeof(virtio_gpu_ctrl_hdr_t),
+              sizeof(virtio_gpu_ctx_create_t),
+              sizeof(virtio_gpu_resource_create_3d_t),
+              sizeof(virtio_gpu_ctx_resource_t),
+              sizeof(virtio_gpu_cmd_submit_3d_t));
+
+serial_printf("virgl: BUILD_ID=%x\n", VIRGL_BUILD_ID);
+serial_printf("virgl: HDR_TEST=%x\n",
+              VIRGL_CMD_HDR(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_SURFACE, 6));
+
+
 
     memset(&vctx, 0, sizeof(vctx));
     vctx.next_res_id = 100;  /* Start high to avoid collision with 2D resources */
@@ -412,304 +568,296 @@ bool virgl_available(void) {
     return virtio_gpu_has_virgl();
 }
 
-
-static bool virgl_create_shader(uint32_t handle, uint32_t shader_type,
-                                const uint32_t *tokens, uint32_t num_tokens)
+static void emit_bytes(const void *data, uint32_t len)
 {
-    virgl_cmd_begin();
-    // Meta: handle + type + num_tokens + so_num_outputs + stride[4] = 8 dwords
-    emit(VIRGL_CMD_HDR(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_SHADER, 8 + num_tokens));
-    emit(handle);
-    emit(shader_type);
-    emit(num_tokens);
-    emit(0); // so_num_outputs
-    emit(0); emit(0); emit(0); emit(0); // stride[0..3]
-    for (uint32_t i = 0; i < num_tokens; i++) {
-        emit(tokens[i]);
+    const uint8_t *p = (const uint8_t*)data;
+    uint32_t nwords = (len + 3) / 4;
+
+    for (uint32_t w = 0; w < nwords; w++) {
+        uint32_t word = 0;
+        for (int b = 0; b < 4; b++) {
+            uint32_t idx = w * 4 + b;
+            if (idx < len)
+                word |= ((uint32_t)p[idx]) << (b * 8);
+        }
+        emit(word);
     }
-    return virgl_cmd_submit();
 }
 
 
-
+/* virgl shader IR type (this is NOT the stage) */
+#define VIRGL_SHADER_IR_TGSI  0u   /* most common / safest */
 static bool virgl_create_shader_text(uint32_t handle,
                                      uint32_t shader_type,
-                                     const char *tgsi_text)
+                                     const char *tgsi_dump_text,
+                                     uint32_t num_tokens /* = binary_token_count */)
 {
-    uint32_t text_len   = (uint32_t)strlen(tgsi_text) + 1;   // include NUL
+    uint32_t text_len  = (uint32_t)strlen(tgsi_dump_text) + 1; // include NUL
     uint32_t text_words = (text_len + 3) / 4;
 
     virgl_cmd_begin();
 
-    // payload = 5 meta dwords + text_words
-    emit(VIRGL_CMD_HDR(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_SHADER, 5 + text_words));
+    // MUST be 6 + text_words (includes num_outputs dword)
+   emit(VIRGL_CMD_HDR(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_SHADER, 5 + text_words));
     emit(handle);
     emit(shader_type);
 
-    emit(text_words); // <-- IMPORTANT: not 0
-    emit(0);          // offset
-    emit(0);          // so_num_outputs
+    // offlen is TOTAL shader text length in bytes (first chunk), CONT bit clear
+    emit(VIRGL_OBJ_SHADER_OFFSET_VAL(text_len));
+    emit(num_tokens);   // MUST be tgsi_num_tokens(tokens) / (bin_len/4)
+    emit(0);            // num_outputs (streamout) = 0
 
-    emit_string(tgsi_text);
+    emit_bytes(tgsi_dump_text, text_len);
+
+    return virgl_cmd_submit();
+}
+
+static bool virgl_create_shader(uint32_t handle, uint32_t shader_type,
+                                const uint32_t *tokens, uint32_t num_tokens)
+{
+    if (num_tokens < 2) return false;
+
+    virgl_cmd_begin();
+
+    emit(VIRGL_CMD_HDR(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_SHADER, 5 + num_tokens));
+    emit(handle);
+    emit(shader_type);
+    emit(VIRGL_OBJ_SHADER_OFFSET_VAL_BYTES(num_tokens * 4u));  // byte length
+    emit(num_tokens);
+    emit(0); // num_so_outputs
+
+    // Emit ALL tokens verbatim — token[0] is already the correct TGSI header
+    for (uint32_t i = 0; i < num_tokens; i++)
+        emit(tokens[i]);
 
     return virgl_cmd_submit();
 }
 
 
+
+
+#ifndef ARRAY_SIZE
+#define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
+#endif
+
 bool virgl_setup_pipeline_state(void)
 {
-    serial_printf("******** NEW PIPELINE FUNCTION LOADED ********\n");
+    virgl_ctx_t *vctx = virgl_get_ctx();
+    if (!vctx || !vctx->initialized) return false;
+
     serial_printf("virgl_pipeline: === BEGIN PIPELINE SETUP ===\n");
 
     uint32_t handle;
 
-    /* ------------------------------------------------------------
-     * 0) Create SURFACE objects (separate submits are fine)
-     * ------------------------------------------------------------ */
-
-    /* Color surface */
+    /* ---- Color surface ---- */
     handle = alloc_res_id();
-    vctx.color_surface_handle = handle;
-
+    vctx->color_surface_handle = handle;
     virgl_cmd_begin();
     emit(VIRGL_CMD_HDR(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_SURFACE, 5));
     emit(handle);
-    emit(vctx.fb_res_id);
-    emit(VIRGL_FORMAT_B8G8R8X8_UNORM);
-    emit(0); /* level */
-    emit(0); /* first_layer=0 | last_layer=0 */
-    if (!virgl_cmd_submit()) {
-        serial_printf("virgl: failed to create color surface\n");
-        return false;
-    }
+    emit(vctx->fb_res_id);
+    emit(VIRGL_FORMAT_B8G8R8A8_UNORM);  // 1
+    emit(0);
+    emit(0);
+  //  emit(0); // last_layer
+    serial_printf("SURFACE COLOR submit (handle=%u res=%u)...\n", handle, vctx->fb_res_id);
+    if (!virgl_cmd_submit()) { serial_printf("SURFACE COLOR FAILED\n"); return false; }
+    serial_printf("SURFACE COLOR OK\n");
 
-    /* Depth surface */
+    /* ---- Depth surface ---- */
     handle = alloc_res_id();
-    vctx.depth_surface_handle = handle;
-
+    vctx->depth_surface_handle = handle;
     virgl_cmd_begin();
     emit(VIRGL_CMD_HDR(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_SURFACE, 5));
     emit(handle);
-    emit(vctx.depth_res_id);
+    emit(vctx->depth_res_id);
     emit(VIRGL_FORMAT_Z16_UNORM);
-    emit(0); /* level */
-    emit(0); /* first_layer=0 | last_layer=0 */
-    if (!virgl_cmd_submit()) {
-        serial_printf("virgl: failed to create depth surface\n");
-        return false;
-    }
+    emit(0);
+    emit(0);
+ //     emit(0); // last_layer
+    serial_printf("SURFACE DEPTH submit (handle=%u res=%u)...\n", handle, vctx->depth_res_id);
+    if (!virgl_cmd_submit()) { serial_printf("SURFACE DEPTH FAILED\n"); return false; }
+    serial_printf("SURFACE DEPTH OK\n");
 
-    /* ------------------------------------------------------------
-     * 1) Create state objects (BLEND + RASTERIZER + DSA + VE)
-     *    IMPORTANT: ONE begin and ONE submit
-     * ------------------------------------------------------------ */
+    /* ---- Blend ---- */
+//    handle = alloc_res_id();
+  //  vctx->blend_handle = 0;
+    
+   // serial_printf("BLEND OK\n");
 
+    handle = alloc_res_id();
+    vctx->blend_handle = handle;
     virgl_cmd_begin();
+emit(VIRGL_CMD_HDR(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_BLEND, 11));
+emit(handle);
+emit(0);           // s0: logicop/dither flags
+emit(0);           // s1: logicop func
+for (int i = 0; i < 8; i++) {
+    emit(0x78000000);  // colormask=0xF (RGBA) in bits[30:27], blend_enable=0
+}
+    serial_printf("BLEND submit (handle=%u len=27)...\n", handle);
+    if (!virgl_cmd_submit()) { serial_printf("BLEND FAILED\n"); return false; }
+    serial_printf("BLEND OK\n");
 
-    /* ---- BLEND (payload MUST be 11: handle + s0 + s1 + 8 RTs) ---- */
+
+    /* ---- Rasterizer ---- */
     handle = alloc_res_id();
-    vctx.blend_handle = handle;
-
-    /* safe: no blending, write RGBA */
-    uint32_t s0 = 0;
-    uint32_t s1 = 0;
-
-    /* PIPE_MASK_RGBA is usually 0xF (unshifted). virgl expects it in bits 27..30. */
-    uint32_t rt_mask = ((PIPE_MASK_RGBA & 0xF) << 27);
-
-    emit(VIRGL_CMD_HDR(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_BLEND, 11));
-    emit(handle);
-    emit(s0);
-    emit(s1);
-    /* 8 render targets required by protocol */
-    emit(rt_mask); /* RT0 */
-    emit(rt_mask); /* RT1 */
-    emit(rt_mask); /* RT2 */
-    emit(rt_mask); /* RT3 */
-    emit(rt_mask); /* RT4 */
-    emit(rt_mask); /* RT5 */
-    emit(rt_mask); /* RT6 */
-    emit(rt_mask); /* RT7 */
-
-    /* ---- RASTERIZER (payload = 9) ---- */
-    handle = alloc_res_id();
-    vctx.rasterizer_handle = handle;
-
+    vctx->rasterizer_handle = handle;
+    virgl_cmd_begin();
     emit(VIRGL_CMD_HDR(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_RASTERIZER, 9));
     emit(handle);
-    emit((1 << 1));   /* S0: depth_clip enabled */
-    emit(f2u(1.0f));  /* point_size */
-    emit(0);          /* sprite_coord_enable */
-    emit(0);          /* S3 */
-    emit(f2u(1.0f));  /* line_width */
-    emit(0);          /* offset_units */
-    emit(0);          /* offset_scale */
-    emit(0);          /* offset_clamp */
+    emit((1u << 1));
+    emit(f2u(1.0f));
+    emit(0);
+    emit(0);
+    emit(f2u(1.0f));
+    emit(0);
+    emit(0);
+    emit(0);
+    serial_printf("RAST submit (handle=%u len=9)...\n", handle);
+    if (!virgl_cmd_submit()) { serial_printf("RAST FAILED\n"); return false; }
+    serial_printf("RAST OK\n");
 
-    /* ---- DSA (payload = 5) ---- */
+    /* ---- DSA ---- */
     handle = alloc_res_id();
-    vctx.dsa_handle = handle;
-
+    vctx->dsa_handle = handle;
+    virgl_cmd_begin();
     emit(VIRGL_CMD_HDR(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_DSA, 5));
     emit(handle);
-    emit( (1 << 0) | (1 << 1) | (PIPE_FUNC_LESS << 2) ); /* depth enable + write + LESS */
-    emit(0); /* stencil[0] */
-    emit(0); /* stencil[1] */
-    emit(0); /* alpha_ref */
+    emit((1u << 0) | (1u << 1) | ((uint32_t)PIPE_FUNC_LESS << 2));
+    emit(0);
+    emit(0);
+    emit(0);
+    serial_printf("DSA submit (handle=%u len=5)...\n", handle);
+    if (!virgl_cmd_submit()) { serial_printf("DSA FAILED\n"); return false; }
+    serial_printf("DSA OK\n");
 
-    /* ---- VERTEX ELEMENTS (payload = 9) ---- */
+    /* ---- Vertex Elements ---- */
     handle = alloc_res_id();
-    vctx.ve_handle = handle;
-
-    emit(VIRGL_CMD_HDR(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_VERTEX_ELEMENTS, 9));
-    emit(handle);
-
-    /* Element 0: position xyz at offset 0 */
-    emit(0);                            /* src_offset */
-    emit(0);                            /* instance_divisor */
-    emit(0);                            /* vb_index */
-    emit(VIRGL_FORMAT_R32G32B32_FLOAT); /* src_format */
-
-    /* Element 1: color rgba at offset 12 */
-    emit(12);                               /* src_offset */
-    emit(0);                                /* instance_divisor */
-    emit(0);                                /* vb_index */
-    emit(VIRGL_FORMAT_R32G32B32A32_FLOAT);  /* src_format */
-
-    if (!virgl_cmd_submit()) {
-        serial_printf("virgl: failed to create pipeline state objects\n");
-        return false;
-    }
-
-    /* ------------------------------------------------------------
-     * 2) Shaders (TGSI text)
-     * ------------------------------------------------------------ */
-/*
-    static const char vs_tgsi[] =
-        "VERT\n"
-        "DCL IN[0]\n"
-        "DCL IN[1]\n"
-        "DCL OUT[0], POSITION\n"
-        "DCL OUT[1], GENERIC[0]\n"
-        "DCL CONST[0..3]\n"
-        "DCL TEMP[0]\n"
-        "  0: DP4 TEMP[0].x, CONST[0], IN[0]\n"
-        "  1: DP4 TEMP[0].y, CONST[1], IN[0]\n"
-        "  2: DP4 TEMP[0].z, CONST[2], IN[0]\n"
-        "  3: DP4 TEMP[0].w, CONST[3], IN[0]\n"
-        "  4: MOV OUT[0], TEMP[0]\n"
-        "  5: MOV OUT[1], IN[1]\n"
-        "  6: END\n";
-
-    static const char fs_tgsi[] =
-        "FRAG\n"
-        "DCL IN[0], GENERIC[0], COLOR\n"
-        "DCL OUT[0], COLOR\n"
-        "  0: MOV OUT[0], IN[0]\n"
-        "  1: END\n";
-
-
- virgl_cmd_begin();
-
-    handle = alloc_res_id();
-    vctx.vs_handle = handle;
-    if (!virgl_create_shader_text(handle, PIPE_SHADER_VERTEX, vs_tgsi)) {
-        serial_printf("virgl: failed to create vertex shader\n");
-        return false;
-    }
-
-
-
-
-    handle = alloc_res_id();
-    vctx.fs_handle = handle;
-    if (!virgl_create_shader_text(handle, PIPE_SHADER_FRAGMENT, fs_tgsi)) {
-        serial_printf("virgl: failed to create fragment shader\n");
-        return false;
-    }
-
-virgl_cmd_submit();*/
-/* ------------------------------------------------------------
- * 2) Shaders (TGSI binary tokens)
- * ------------------------------------------------------------ */
-vctx.vs_handle = alloc_res_id();
-if (!virgl_create_shader(vctx.vs_handle, 0 /* try 1 for VS */, vs_tokens, VS_NUM_TOKENS))
-    return false;
-
-vctx.fs_handle = alloc_res_id();
-if (!virgl_create_shader(vctx.fs_handle, 1 /* try 0 for FS */, fs_tokens, FS_NUM_TOKENS))
-    return false;
-
-    /* ------------------------------------------------------------
-     * 3) Bind objects + framebuffer + viewport + scissor
-     * ------------------------------------------------------------ */
-
+    vctx->ve_handle = handle;
     virgl_cmd_begin();
+emit(VIRGL_CMD_HDR(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_VERTEX_ELEMENTS, 5));
+emit(handle);       /* word 0: handle */
+emit(0);            /* word 1: src_offset    } element 0 */
+emit(0);            /* word 2: instance_div  }            */
+emit(0);            /* word 3: vb_index      }  4 words  */
+emit(PIPE_FORMAT_R32G32B32A32_FLOAT); /* word 4: format */
+/* num_elements = (5-1)/4 = 1 ✓ */
+    serial_printf("VE submit (handle=%u len=6)...\n", handle);
+    if (!virgl_cmd_submit()) { serial_printf("VE FAILED\n"); return false; }
+    serial_printf("VE OK\n");
+
+    /* ---- Vertex Shader ---- */
+static const char *vs_dump =
+"VERT\n"
+"DCL IN[0]\n"
+"DCL OUT[0], POSITION\n"
+"DCL TEMP[0], LOCAL\n"
+"IMM[0] FLT32 {    0.0000,     1.0000,     0.0000,     0.0000}\n"
+"  0: MOV TEMP[0].zw, IMM[0].yyxy\n"
+"  1: MOV TEMP[0].xy, IN[0].xyxx\n"
+"  2: MOV OUT[0], TEMP[0]\n"
+"  3: END\n";
+
+static const char *fs_dump =
+"FRAG\n"
+"PROPERTY FS_COLOR0_WRITES_ALL_CBUFS 1\n"
+"DCL OUT[0], COLOR\n"
+"IMM[0] FLT32 {    1.0000,     0.0000,     0.0000,     0.0000}\n"
+"  0: MOV OUT[0], IMM[0].xyxx\n"
+"  1: END\n";
+
+handle = alloc_res_id();
+vctx->vs_handle = handle;
+if (!virgl_create_shader_text(handle, PIPE_SHADER_VERTEX,   vs_dump, 26)){
+    serial_printf("VS FAILED\n");
+    return false;
+}
+
+
+
+handle = alloc_res_id();
+vctx->fs_handle = handle;
+if  (!virgl_create_shader_text(handle, PIPE_SHADER_FRAGMENT, fs_dump, 16)) {
+    serial_printf("FS FAILED\n");
+    return false;
+}
+
+
+/*
+uint32_t vs_tokens = dwords(VS_BIN_LEN);  // 104/4 = 26
+uint32_t fs_tokens = dwords(FS_BIN_LEN);  //  64/4 = 16
+
+
+handle = alloc_res_id();
+vctx->vs_handle = handle;
+
+
+
+serial_printf("VS submit (handle=%u) [BINARY TGSI]...\n", handle);
+if (!virgl_create_shader(handle, PIPE_SHADER_VERTEX,
+                         as_u32(vs_bin), vs_tokens)){ return false;}
+  
+
+handle = alloc_res_id();
+vctx->fs_handle = handle;
+
+serial_printf("FS submit (handle=%u) [BINARY TGSI]...\n", handle);
+if (!virgl_create_shader(handle, PIPE_SHADER_FRAGMENT,
+                         as_u32(fs_bin), fs_tokens)){ return false;}
+   
+*/
+    virgl_cmd_begin() ;
 
     emit(VIRGL_CMD_HDR(VIRGL_CCMD_BIND_OBJECT, VIRGL_OBJECT_BLEND, 1));
-    emit(vctx.blend_handle);
-
+    emit(vctx->blend_handle);
     emit(VIRGL_CMD_HDR(VIRGL_CCMD_BIND_OBJECT, VIRGL_OBJECT_RASTERIZER, 1));
-    emit(vctx.rasterizer_handle);
-
+    emit(vctx->rasterizer_handle);
     emit(VIRGL_CMD_HDR(VIRGL_CCMD_BIND_OBJECT, VIRGL_OBJECT_DSA, 1));
-    emit(vctx.dsa_handle);
-
-emit(VIRGL_CMD_HDR(VIRGL_CCMD_BIND_OBJECT, VIRGL_OBJECT_SHADER, 2));
-emit(PIPE_SHADER_VERTEX);
-emit(vctx.vs_handle);
-
-emit(VIRGL_CMD_HDR(VIRGL_CCMD_BIND_OBJECT, VIRGL_OBJECT_SHADER, 2));
-emit(PIPE_SHADER_FRAGMENT);
-emit(vctx.fs_handle);
-
-
+    emit(vctx->dsa_handle);
     emit(VIRGL_CMD_HDR(VIRGL_CCMD_BIND_OBJECT, VIRGL_OBJECT_VERTEX_ELEMENTS, 1));
-    emit(vctx.ve_handle);
+    emit(vctx->ve_handle);
 
-
-
-
-
-    /* Framebuffer: 1 color + depth (your earlier order worked) */
-    serial_printf("virgl: FB_STATE emit: nr=1 zsurf=%u cbuf0=%u\n",
-                  vctx.depth_surface_handle, vctx.color_surface_handle);
+    emit(VIRGL_CMD_HDR(VIRGL_CCMD_BIND_SHADER, 0, 2));
+    emit(vctx->vs_handle);
+    emit(PIPE_SHADER_VERTEX);
+    emit(VIRGL_CMD_HDR(VIRGL_CCMD_BIND_SHADER, 0, 2));
+    emit(vctx->fs_handle);
+    emit(PIPE_SHADER_FRAGMENT);
 
     emit(VIRGL_CMD_HDR(VIRGL_CCMD_SET_FRAMEBUFFER_STATE, 0, 3));
-    emit(1); /* nr_cbufs */
-    emit(vctx.depth_surface_handle);
-    emit(vctx.color_surface_handle);
+    emit(1);
+    emit(vctx->depth_surface_handle);
+    emit(vctx->color_surface_handle);
 
-    /* Viewport: payload 7 (index + 6 floats) */
     emit(VIRGL_CMD_HDR(VIRGL_CCMD_SET_VIEWPORT_STATE, 0, 7));
     emit(0);
-    emit(f2u(vctx.fb_width  / 2.0f));
-    emit(f2u(vctx.fb_height / 2.0f));
+    emit(f2u(vctx->fb_width  / 2.0f));
+    emit(f2u(vctx->fb_height / 2.0f));
     emit(f2u(1.0f));
-    emit(f2u(vctx.fb_width  / 2.0f));
-    emit(f2u(vctx.fb_height / 2.0f));
+    emit(f2u(vctx->fb_width  / 2.0f));
+    emit(f2u(vctx->fb_height / 2.0f));
     emit(f2u(0.0f));
 
-    /* Scissor: payload 5 */
-    emit(VIRGL_CMD_HDR(VIRGL_CCMD_SET_SCISSOR_STATE, 0, 5));
+    emit(VIRGL_CMD_HDR(VIRGL_CCMD_SET_SCISSOR_STATE, 0, 3));
     emit(0);
     emit(0);
-    emit(0);
-    emit(vctx.fb_width);
-    emit(vctx.fb_height);
+    emit(((uint32_t)vctx->fb_width) | ((uint32_t)vctx->fb_height << 16));
 
-    if (!virgl_cmd_submit()) {
-        serial_printf("virgl: failed to bind pipeline state\n");
-        return false;
-    }
+emit(VIRGL_CMD_HDR(VIRGL_CCMD_SET_VERTEX_BUFFERS, 0, 3));
+emit(28);              /* stride */
+emit(0);               /* offset */
+emit(vctx->vbo_res_id);
+
+    serial_printf("BIND+STATE submit...\n");
+    if (!virgl_cmd_submit()) { serial_printf("BIND+STATE FAILED\n"); return false; }
+    serial_printf("BIND+STATE OK\n");
 
     serial_printf("virgl_pipeline: === PIPELINE SETUP COMPLETE ===\n");
-    serial_printf("  surfaces: color=%u depth=%u\n",
-                  vctx.color_surface_handle, vctx.depth_surface_handle);
+    serial_printf("  surfaces: color=%u depth=%u\n", vctx->color_surface_handle, vctx->depth_surface_handle);
     serial_printf("  state: blend=%u rast=%u dsa=%u ve=%u vs=%u fs=%u\n",
-                  vctx.blend_handle, vctx.rasterizer_handle, vctx.dsa_handle,
-                  vctx.ve_handle, vctx.vs_handle, vctx.fs_handle);
-
+                  vctx->blend_handle, vctx->rasterizer_handle, vctx->dsa_handle,
+                  vctx->ve_handle, vctx->vs_handle, vctx->fs_handle);
     return true;
 }
 
@@ -729,15 +877,12 @@ bool virgl_setup_framebuffer(uint16_t width, uint16_t height)
     vctx.fb_res_id = alloc_res_id();
     serial_printf("virgl: creating 3D color buffer resource %u\n", vctx.fb_res_id);
 
-    if (!virgl_create_resource_3d(vctx.fb_res_id,
-                                  PIPE_TEXTURE_2D,
-                                  VIRGL_FORMAT_B8G8R8X8_UNORM,
-                                  VIRGL_BIND_RENDER_TARGET,
-                                  width, height, 1))
-    {
-        serial_printf("virgl: failed to create 3D color buffer\n");
-        return false;
-    }
+if (!virgl_create_resource_3d(vctx.fb_res_id,
+                              PIPE_TEXTURE_2D,
+                              VIRGL_FORMAT_B8G8R8A8_UNORM,  // 1
+                              VIRGL_BIND_RENDER_TARGET,
+                              width, height, 1))
+    return false;
 
     void *fb_mem = kmalloc(fb_size + 4096);
     if (!fb_mem) return false;
@@ -763,18 +908,16 @@ bool virgl_setup_framebuffer(uint16_t width, uint16_t height)
     vctx.depth_res_id = alloc_res_id();
     serial_printf("virgl: creating depth buffer resource %u\n", vctx.depth_res_id);
 
-    if (!virgl_create_resource_3d(vctx.depth_res_id,
-                                  PIPE_TEXTURE_2D,
-                                  VIRGL_FORMAT_Z16_UNORM,
-                                  VIRGL_BIND_DEPTH_STENCIL,
-                                  width, height, 1))
-    {
-        serial_printf("virgl: failed to create depth buffer\n");
-        return false;
-    }
+if (!virgl_create_resource_3d(vctx.depth_res_id,
+                              PIPE_TEXTURE_2D,
+                              VIRGL_FORMAT_Z16_UNORM,        // 142
+                              VIRGL_BIND_DEPTH_STENCIL,
+                              width, height, 1))
+    return false;
 
     /* backing size for depth can be minimal; but keep yours for now */
-    const uint32_t depth_size = (uint32_t)width * (uint32_t)height * 4;
+    const uint32_t depth_size = (uint32_t)width * (uint32_t)height * 2; // Z16 = 2 bytes/px
+
 
     void *depth_mem = kmalloc(depth_size + 4096);
     if (!depth_mem) return false;
@@ -801,7 +944,7 @@ bool virgl_setup_framebuffer(uint16_t width, uint16_t height)
 
     if (!virgl_create_resource_3d(vctx.vbo_res_id,
                                   PIPE_BUFFER,
-                                  VIRGL_FORMAT_R8G8B8A8_UNORM,
+                                  VIRGL_FORMAT_NONE,
                                   VIRGL_BIND_VERTEX_BUFFER,
                                   vctx.vbo_size, 1, 1))
     {
@@ -859,6 +1002,15 @@ if (!gpu3d_cmd_ok(&cmd, sizeof(cmd))) {
         return false;
     }
 
+
+// ADD THIS:
+if (!virgl_ctx_attach(vctx.display_res_id)) {
+    serial_printf("virgl: failed to attach display resource %u to context\n", vctx.display_res_id);
+    return false;
+}
+
+
+
     /* Scanout */
     virtio_gpu_set_scanout_t scanout;
     memset(&scanout, 0, sizeof(scanout));
@@ -898,6 +1050,11 @@ void virgl_cmd_begin(void) {
 
 void virgl_cmd_begin(void)
 {
+
+
+    serial_printf("VIRGL_BUILD_ID=%x HDR_TEST=%x\n",
+              VIRGL_BUILD_ID,
+              VIRGL_CMD_HDR(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_SURFACE, 6));
     vctx.cmd_pos = 0;
     serial_printf("CMD_BEGIN: reset cmd_pos=0\n");
 }
@@ -916,29 +1073,31 @@ void virgl_cmd_set_viewport(uint32_t w, uint32_t h)
     emit(f2u(0.0f));        // translate.z
 }
 
+static inline void emit_u64(uint64_t v) {
+    emit((uint32_t)(v & 0xFFFFFFFFu));
+    emit((uint32_t)(v >> 32));
+}
+
+static inline uint64_t d2u(double d) {
+    union { double d; uint64_t u; } x;
+    x.d = d;
+    return x.u;
+}
 
 void virgl_cmd_clear(uint32_t buffers,
                      float r, float g, float b, float a,
-                     float depth, uint32_t stencil)
+                     double depth, uint32_t stencil)
 {
-    uint32_t ur = f2u(r);
-    uint32_t ug = f2u(g);
-    uint32_t ub = f2u(b);
-    uint32_t ua = f2u(a);
-    uint32_t ud = f2u(depth);
-
-    serial_printf("CLEAR EMIT: ur=%x ug=%x ub=%x ua=%x ud=%x\n",
-                  ur, ug, ub, ua, ud);
-
-    emit(VIRGL_CMD_HDR(VIRGL_CCMD_CLEAR, 0, 7));
+    emit(VIRGL_CMD_HDR(VIRGL_CCMD_CLEAR, 0, 8));
     emit(buffers);
-    emit(ur);
-    emit(ug);
-    emit(ub);
-    emit(ua);
-    emit(ud);
+    emit(f2u(r));
+    emit(f2u(g));
+    emit(f2u(b));
+    emit(f2u(a));
+    emit_u64(d2u(depth));   // 2 dwords
     emit(stencil);
 }
+
 
 
 /*
@@ -995,20 +1154,15 @@ uint32_t virgl_upload_vertices(const float* data, uint32_t num_floats) {
     return 0;  /* offset = 0 (we always write at start for simplicity) */
 }
 
-void virgl_cmd_set_vertex_buffer(uint32_t stride, uint32_t offset) {
-    /*
-     * SET_VERTEX_BUFFERS: header + { stride, offset, res_handle } per buffer
-     * NOTE: There is NO count field — number of VBOs = payload_len / 3.
-     *       For 1 VBO: payload = 3 words.
-     */
-emit(VIRGL_CMD_HDR(VIRGL_CCMD_SET_VERTEX_BUFFERS, 0, 5));
-emit(0);        // start slot
-emit(1);        // count
-emit(stride);
-emit(offset);
-emit(vctx.vbo_res_id);
-
+void virgl_cmd_set_vertex_buffer(uint32_t stride, uint32_t offset)
+{
+    emit(VIRGL_CMD_HDR(VIRGL_CCMD_SET_VERTEX_BUFFERS, 0, 3));
+    emit(stride);
+    emit(offset);
+    emit(vctx.vbo_res_id);
 }
+
+
 
 void virgl_cmd_draw(uint32_t prim_mode, uint32_t start, uint32_t count) {
     /*
@@ -1044,27 +1198,13 @@ void virgl_cmd_set_constant_buffer(uint32_t shader_type,
     }
 }
 
-bool virgl_cmd_submit(void) {
-    if (vctx.cmd_pos == 0) return true;
 
-    uint32_t num_words = vctx.cmd_pos;
-    uint32_t size_bytes = num_words * sizeof(uint32_t);
 
-    /* Dump first 40 words (or all if shorter) */
-    serial_printf("CMD_DUMP: %u words:\n", num_words);
-    uint32_t dump_count = num_words < 40 ? num_words : 40;
-    for (uint32_t i = 0; i < dump_count; i++) {
-        serial_printf("  [%u] 0x%x\n", i, vctx.cmd_buf[i]);
-    }
 
-    bool ok = virgl_submit_cmd_buf(vctx.cmd_buf, size_bytes);
-    vctx.cmd_pos = 0;
 
-    if (!ok) {
-        serial_printf("virgl: submit failed (%u words)\n", num_words);
-    }
-    return ok;
-}
+
+
+
 
 void virgl_present(void)
 {

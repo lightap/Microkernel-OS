@@ -364,6 +364,73 @@ bool virtio_gpu_available(void) {
     return false;
 }
 
+bool virtio_gpu_send_cmd_2iov(const void *hdr, uint32_t hdr_len,
+                              const void *data, uint32_t data_len,
+                              void *resp, uint32_t resp_len)
+{
+    if (!hdr || hdr_len == 0) return false;
+
+    uint32_t total = hdr_len + data_len;
+
+    /* We must submit header+payload as ONE virtio-gpu control request.
+       Your transport only supports one OUT buffer, so we pack. */
+
+    uint8_t *out = NULL;
+
+    if (total <= CMD_BUF_SIZE) {
+        out = cmd_buf; /* use the aligned static buffer */
+    } else {
+        /* Fallback: allocate a temporary contiguous buffer.
+           Assumes kmalloc memory is DMA-visible/identity-mapped in your kernel. */
+        out = (uint8_t*)kmalloc(total);
+        if (!out) {
+            serial_printf("virtio-gpu: send_cmd_2iov ENOMEM total=%u\n", total);
+            return false;
+        }
+    }
+
+    /* Build contiguous request */
+    memcpy(out, hdr, hdr_len);
+    if (data_len) memcpy(out + hdr_len, data, data_len);
+
+    /* Prepare response */
+    if (resp_len > CMD_BUF_SIZE) {
+        serial_printf("virtio-gpu: resp too big (%u)\n", resp_len);
+        if (out != cmd_buf) kfree(out);
+        return false;
+    }
+    memset(resp_buf, 0, resp_len);
+
+    /* Submit to control queue */
+    int head = virtio_send(&gpu_dev, VIRTIO_GPU_QUEUE_CONTROL,
+                           (uint32_t)out, total,
+                           (uint32_t)resp_buf, resp_len);
+    if (head < 0) {
+        serial_printf("virtio-gpu: failed to submit 2iov cmd\n");
+        if (out != cmd_buf) kfree(out);
+        return false;
+    }
+
+    virtio_notify(&gpu_dev, VIRTIO_GPU_QUEUE_CONTROL);
+    virtio_wait(&gpu_dev, VIRTIO_GPU_QUEUE_CONTROL);
+
+    /* Copy response back */
+    if (resp && resp_len) {
+        memcpy(resp, resp_buf, resp_len);
+
+        virtio_gpu_ctrl_hdr_t *rh = (virtio_gpu_ctrl_hdr_t*)resp;
+        if (rh->type >= VIRTIO_GPU_RESP_ERR_UNSPEC) {
+            serial_printf("virtio-gpu: command error, type=%x\n", rh->type);
+            if (out != cmd_buf) kfree(out);
+            return false;
+        }
+    }
+
+    if (out != cmd_buf) kfree(out);
+    return true;
+}
+
+
 bool virtio_gpu_set_mode(uint16_t width, uint16_t height) {
     if (!gpu_initialized && !virtio_gpu_init()) return false;
 
