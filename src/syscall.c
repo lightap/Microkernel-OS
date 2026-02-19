@@ -173,7 +173,7 @@ static void syscall_handler(registers_t* regs) {
     case SYS_DEBUG_LOG: {
         /* arg1 = string pointer */
         const char* msg = (const char*)arg1;
-        serial_printf("[PID %u] %s", task_get_current() ? task_get_current()->id : 0, msg);
+        //serial_printf("[PID %u] %s", task_get_current() ? task_get_current()->id : 0, msg);
         regs->eax = 0;
         break;
     }
@@ -253,20 +253,20 @@ case SYS_VIRGL_SUBMIT: {
         /* arg1 = width, arg2 = height */
         uint32_t w = arg1 ? arg1 : 320;
         uint32_t h = arg2 ? arg2 : 200;
-        serial_printf("GPU3D: init %ux%u\n", w, h);
+        //serial_printf("GPU3D: init %ux%u\n", w, h);
 
         if (!virgl_init()) {
-            serial_printf("GPU3D: virgl_init FAILED\n");
+            //serial_printf("GPU3D: virgl_init FAILED\n");
             regs->eax = (uint32_t)-1;
             break;
         }
         if (!virgl_setup_framebuffer((uint16_t)w, (uint16_t)h)) {
-            serial_printf("GPU3D: framebuffer setup FAILED\n");
+            //serial_printf("GPU3D: framebuffer setup FAILED\n");
             regs->eax = (uint32_t)-1;
             break;
         }
        if (!virgl_setup_pipeline_state()) {
-            serial_printf("GPU3D: pipeline setup FAILED\n");
+            //serial_printf("GPU3D: pipeline setup FAILED\n");
             regs->eax = (uint32_t)-1;
             break;
         }
@@ -274,54 +274,37 @@ case SYS_VIRGL_SUBMIT: {
  // virgl_cmd_begin();
      virgl_cmd_set_viewport((uint16_t)w, (uint16_t)h);  // or w/h you stored
   // virgl_cmd_submit();
-        serial_printf("GPU3D: init OK\n");
+        //serial_printf("GPU3D: init OK\n");
         regs->eax = 0;
         break;
     }
 
+/* In your sys_gpu3d_clear kernel handler */
 case SYS_GPU3D_CLEAR: {
+    uint32_t packed = arg2;
 
-      uint32_t w = arg1 ? arg1 : 320;
-        uint32_t h = arg2 ? arg2 : 300;
-    serial_printf("GPU3D_CLEAR: called, flags=%u color=%08x\n", arg1, arg2);
-    uint32_t flags = arg1;
-    
-    uint32_t col = arg2;
-    float r = (float)((col >> 16) & 0xFF) / 255.0f;
-    float g = (float)((col >>  8) & 0xFF) / 255.0f;
-    float b = (float)((col >>  0) & 0xFF) / 255.0f;
-    float a = (float)((col >> 24) & 0xFF) / 255.0f;
-    
-    serial_printf("GPU3D_CLEAR: rgba=(%u,%u,%u,%u)/255\n",
-                  (col >> 16) & 0xFF, (col >> 8) & 0xFF, col & 0xFF, (col >> 24) & 0xFF);
- 
+    /* Always clear both color and depth — no flag translation needed */
+    uint32_t pipe_flags = 4u | 1u;   /* PIPE_CLEAR_COLOR0 | PIPE_CLEAR_DEPTH */
 
- flags = arg1;
+    float a = ((packed >> 24) & 0xFF) / 255.0f;
+    float r = ((packed >> 16) & 0xFF) / 255.0f;
+    float g = ((packed >>  8) & 0xFF) / 255.0f;
+    float b = ((packed      ) & 0xFF) / 255.0f;
 
-// If you have Z16 depth (no stencil), strip stencil bit
-flags &= ~(PIPE_CLEAR_DEPTH | PIPE_CLEAR_STENCIL);
-
-
-virgl_cmd_begin();
-virgl_cmd_clear(flags, r, g, b, a, 1.0f, 0);
-    serial_printf("GPU3D_CLEAR: submitting\n");
-virgl_cmd_submit();
-
-
-
-    serial_printf("GPU3D_CLEAR: done\n");
+    /* Begin a new command batch for this frame */
+    virgl_cmd_begin();
+    virgl_cmd_clear(pipe_flags, r, g, b, a, 1.0, 0);
+    /* No submit — commands are batched until present */
     regs->eax = 0;
-    
     break;
 }
 
-
 case SYS_GPU3D_UPLOAD: {
     uint32_t num_floats = arg2;
-    serial_printf("GPU3D_UPLOAD: called, num_floats=%u arg1=%p\n", num_floats, (void*)arg1);
+    //serial_printf("GPU3D_UPLOAD: called, num_floats=%u arg1=%p\n", num_floats, (void*)arg1);
     
-    if (num_floats == 0 || num_floats > 32768 || !arg1) {
-        serial_printf("GPU3D_UPLOAD: FAILED validation check\n");
+    if (num_floats == 0 || num_floats > 200000 || !arg1) {
+        //serial_printf("GPU3D_UPLOAD: FAILED validation check\n");
         regs->eax = (uint32_t)-EINVAL;
         break;
     }
@@ -329,24 +312,23 @@ case SYS_GPU3D_UPLOAD: {
     uint32_t sz = num_floats * sizeof(float);
     float* kbuf = (float*)kmalloc(sz);
     if (!kbuf) { 
-        serial_printf("GPU3D_UPLOAD: FAILED kmalloc\n");
+        //serial_printf("GPU3D_UPLOAD: FAILED kmalloc\n");
         regs->eax = (uint32_t)-ENOMEM; 
         break; 
     }
     
     if (copy_from_user(kbuf, (void*)arg1, sz) != 0) {
-        serial_printf("GPU3D_UPLOAD: FAILED copy_from_user\n");
+        //serial_printf("GPU3D_UPLOAD: FAILED copy_from_user\n");
         kfree(kbuf);
         regs->eax = (uint32_t)-EFAULT;
         break;
     }
     
-    serial_printf("GPU3D_UPLOAD: uploading %u floats (%u bytes)\n", num_floats, sz);
-    virgl_cmd_begin();
+    //serial_printf("GPU3D_UPLOAD: uploading %u floats (%u bytes)\n", num_floats, sz);
+    /* Just emit into the batch — no begin/submit (batched until present) */
     virgl_upload_vertices(kbuf, num_floats);
-    virgl_cmd_submit();
     kfree(kbuf);
-    serial_printf("GPU3D_UPLOAD: SUCCESS\n");
+    //serial_printf("GPU3D_UPLOAD: SUCCESS\n");
     regs->eax = 0;
     break;
 }
@@ -358,19 +340,16 @@ case SYS_GPU3D_UPLOAD: {
             regs->eax = (uint32_t)-EFAULT;
             break;
         }
-        virgl_cmd_begin();
+        /* Just emit into the batch — no begin/submit (batched until present) */
         virgl_cmd_set_constant_buffer(PIPE_SHADER_VERTEX, mvp, 16);
-        virgl_cmd_submit();
         regs->eax = 0;
         break;
     }
 case SYS_GPU3D_DRAW: {
-    /* arg1 = prim_mode (PIPE_PRIM_*), arg2 = start, arg3 = count */
-    serial_printf("GPU3D_DRAW: mode=%u start=%u count=%u\n", arg1, arg2, arg3);
-    virgl_cmd_begin();
-    virgl_cmd_set_vertex_buffer(28, 0);  /* stride=28 (7 floats per vertex) */
+    //serial_printf("GPU3D_DRAW: mode=%u start=%u count=%u\n", arg1, arg2, arg3);
+    /* Just emit into the batch — no begin/submit (batched until present) */
+    virgl_cmd_set_vertex_buffer(32, 0);
     virgl_cmd_draw(arg1, arg2, arg3);
-    virgl_cmd_submit();
     regs->eax = 0;
     break;
 }
@@ -378,20 +357,22 @@ case SYS_GPU3D_DRAW: {
 // src/syscall.c
 
     case SYS_GPU3D_PRESENT: {
-        serial_printf("GPU3D_PRESENT: starting present\n");
+        //serial_printf("GPU3D_PRESENT: starting present\n");
         
-        // 1. Perform the transfer from GPU to Guest RAM
+        /* 1. Submit the entire batched frame (clear + uploads + draws) in ONE round-trip */
+        virgl_cmd_submit();
+        
+        /* 2. Copy rendered result to scanout + flush (2 more round-trips) */
         virgl_present();
         
-        serial_printf("GPU3D_PRESENT: virgl_present done\n");
+        //serial_printf("GPU3D_PRESENT: virgl_present done\n");
         
-        // 2. Notify GUI that frame is ready
+        /* 3. Notify GUI that frame is ready */
         task_t* t = task_get_current();
         gui_elf_win_present(t->id);
         
         /* 
-         * 3. TARGET FIX FOR VISIBILITY:
-         * Sleep for 1 tick (10ms). This limits the app to 100 FPS
+         * 4. Sleep for 1 tick (10ms). This limits the app to 100 FPS
          * and gives the GUI loop enough time to blit the frame
          * to the actual VGA screen.
          */
@@ -404,8 +385,8 @@ case SYS_GPU3D_DRAW: {
     }
 
     default:
-        serial_printf("Unknown syscall %d from PID %u\n",
-                      num, task_get_current() ? task_get_current()->id : 0);
+        //serial_printf("Unknown syscall %d from PID %u\n",
+              //        num, task_get_current() ? task_get_current()->id : 0);
         regs->eax = (uint32_t)-1;
         break;
     }

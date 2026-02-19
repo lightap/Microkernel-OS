@@ -132,8 +132,9 @@ static bool virgl_dev_initialized = false;
 static virgl_ctx_t vctx;
 
 /* Aligned command/response buffers for GPU commands */
-static uint8_t v3d_cmd_buf[4096] __attribute__((aligned(4096)));
-static uint8_t v3d_resp_buf[4096] __attribute__((aligned(4096)));
+/* Was 4096 — must be larger than biggest command + SUBMIT_3D header */
+static uint8_t v3d_cmd_buf[131072]  __attribute__((aligned(4096)));
+static uint8_t v3d_resp_buf[4096]   __attribute__((aligned(4096)));
 
 static uint32_t* vctx_display_backing = NULL; // Add this global
 static uint32_t* vctx_fb_backing = NULL; 
@@ -153,7 +154,7 @@ static bool gpu3d_cmd(void* cmd, uint32_t cmd_len, void* resp, uint32_t resp_len
                            (uint32_t)v3d_cmd_buf, cmd_len,
                            (uint32_t)v3d_resp_buf, resp_len);
     if (head < 0) {
-        serial_printf("virgl: failed to submit gpu command\n");
+        //serial_printf("virgl: failed to submit gpu command\n");
         return false;
     }
 
@@ -163,7 +164,7 @@ static bool gpu3d_cmd(void* cmd, uint32_t cmd_len, void* resp, uint32_t resp_len
 
     virtio_gpu_ctrl_hdr_t* hdr = (virtio_gpu_ctrl_hdr_t*)resp;
     if (hdr->type >= VIRTIO_GPU_RESP_ERR_UNSPEC) {
-        serial_printf("virgl: gpu command error, type=%x\n", hdr->type);
+        //serial_printf("virgl: gpu command error, type=%x\n", hdr->type);
         return false;
     }
     return true;
@@ -190,7 +191,7 @@ static inline void emit(uint32_t word) {
     if (vctx.cmd_pos < (vctx.cmd_buf_size / 4)) {
         vctx.cmd_buf[vctx.cmd_pos++] = word;
     } else {
-        serial_printf("emit: overflow!\n");
+        //serial_printf("emit: overflow!\n");
     }
 }
 
@@ -220,15 +221,15 @@ static bool virgl_negotiate_features(void) {
     *(volatile uint32_t*)(cfg + VIRTIO_COMMON_DFSELECT) = 0;
     uint32_t features = *(volatile uint32_t*)(cfg + VIRTIO_COMMON_DF);
 
-    serial_printf("virgl: device features[0] = %x\n", features);
+    //serial_printf("virgl: device features[0] = %x\n", features);
 
     if (!(features & (1 << VIRTIO_GPU_F_VIRGL))) {
-        serial_printf("virgl: VIRGL feature NOT supported!\n");
-        serial_printf("virgl: You need: -device virtio-gpu-gl-pci -display gtk,gl=on\n");
+        //serial_printf("virgl: VIRGL feature NOT supported!\n");
+        //serial_printf("virgl: You need: -device virtio-gpu-gl-pci -display gtk,gl=on\n");
         return false;
     }
 
-    serial_printf("virgl: VIRGL feature available!\n");
+    //serial_printf("virgl: VIRGL feature available!\n");
 
     /* Accept VIRGL feature */
     *(volatile uint32_t*)(cfg + VIRTIO_COMMON_GFSELECT) = 0;
@@ -246,7 +247,7 @@ static bool virgl_negotiate_features(void) {
 
     s = *(volatile uint8_t*)(cfg + VIRTIO_COMMON_STATUS);
     if (!(s & VIRTIO_STATUS_FEATURES_OK)) {
-        serial_printf("virgl: device rejected VIRGL feature\n");
+        //serial_printf("virgl: device rejected VIRGL feature\n");
         return false;
     }
 
@@ -263,15 +264,15 @@ static bool virgl_create_context(void) {
     cmd.context_init = 0;     /* MUST be 0 for standard virgl (non-zero = capset flags) */
     memcpy(cmd.debug_name, "microgl3d", 10);
 
-    serial_printf("virgl: CTX_CREATE sizeof=%u (expect 96)\n", sizeof(cmd));
+    //serial_printf("virgl: CTX_CREATE sizeof=%u (expect 96)\n", sizeof(cmd));
 
     if (!gpu3d_cmd_ok(&cmd, sizeof(cmd))) {
-        serial_printf("virgl: CTX_CREATE failed\n");
+        //serial_printf("virgl: CTX_CREATE failed\n");
         return false;
     }
 
     vctx.ctx_id = 1;
-    serial_printf("virgl: created 3D context %u\n", vctx.ctx_id);
+    //serial_printf("virgl: created 3D context %u\n", vctx.ctx_id);
     return true;
 }
 
@@ -303,12 +304,12 @@ bool virgl_create_resource_3d(uint32_t res_id, uint32_t target,
     cmd.flags       = 0;
     cmd.padding     = 0;
 
-    serial_printf("virgl: CREATE_3D res=%u target=%u fmt=%u bind=%x %ux%u sizeof=%u (expect 72)\n",
-                  res_id, target, fmt, bind, width, height, sizeof(cmd));
-serial_printf("CREATE_3D DEBUG: res=%u format=%u\n", res_id, cmd.format);
+    //serial_printf("virgl: CREATE_3D res=%u target=%u fmt=%u bind=%x %ux%u sizeof=%u (expect 72)\n",
+             //     res_id, target, fmt, bind, width, height, sizeof(cmd));
+//serial_printf("CREATE_3D DEBUG: res=%u format=%u\n", res_id, cmd.format);
     bool ok = gpu3d_cmd_ok(&cmd, sizeof(cmd));
     if (!ok) {
-        serial_printf("virgl: CREATE_3D FAILED for res=%u\n", res_id);
+        //serial_printf("virgl: CREATE_3D FAILED for res=%u\n", res_id);
     }
     return ok;
 }
@@ -322,14 +323,14 @@ static bool virgl_ctx_attach(uint32_t res_id) {
     cmd.hdr.ctx_id = vctx.ctx_id;
     cmd.resource_id = res_id;
 
-    serial_printf("virgl: CTX_ATTACH res=%u ctx=%u sizeof=%u (expect 32)\n",
-                  res_id, vctx.ctx_id, sizeof(cmd));
+    //serial_printf("virgl: CTX_ATTACH res=%u ctx=%u sizeof=%u (expect 32)\n",
+              //    res_id, vctx.ctx_id, sizeof(cmd));
 
     bool ok = gpu3d_cmd_ok(&cmd, sizeof(cmd));
     if (!ok) {
-        serial_printf("virgl: CTX_ATTACH FAILED for res=%u\n", res_id);
+        //serial_printf("virgl: CTX_ATTACH FAILED for res=%u\n", res_id);
     } else {
-        serial_printf("virgl: CTX_ATTACH OK res=%u\n", res_id);
+        //serial_printf("virgl: CTX_ATTACH OK res=%u\n", res_id);
     }
     return ok;
 }
@@ -365,13 +366,13 @@ static void virgl_cmd_dump(uint32_t nwords)
 #if VIRGL_DEBUG_DUMP
     if (nwords > VIRGL_DEBUG_DUMP_MAX_WORDS) nwords = VIRGL_DEBUG_DUMP_MAX_WORDS;
 
-    serial_printf("CMD_DUMP: %u words:\n", nwords);
+    //serial_printf("CMD_DUMP: %u words:\n", nwords);
     for (uint32_t i = 0; i < nwords; i++) {
         /* IMPORTANT:
-         * Your serial_printf("%x") already prints "0x........" in your logs.
+         * Your //serial_printf("%x") already prints "0x........" in your logs.
          * So DO NOT add "0x" in the format string or you get "0x0x....".
          */
-        serial_printf("  [%u] %x\n", i, vctx.cmd_buf[i]);
+        //serial_printf("  [%u] %x\n", i, vctx.cmd_buf[i]);
     }
 #else
     (void)nwords;
@@ -388,7 +389,7 @@ static bool virgl_submit_cmd_buf(uint32_t *cmds, uint32_t size_bytes)
 
     /* SUBMIT_3D payload should be dword-aligned */
     if (size_bytes & 3u) {
-        serial_printf("virgl: submit_3d size not 4-byte aligned: %u\n", size_bytes);
+        //serial_printf("virgl: submit_3d size not 4-byte aligned: %u\n", size_bytes);
         return false;
     }
 
@@ -397,8 +398,8 @@ static bool virgl_submit_cmd_buf(uint32_t *cmds, uint32_t size_bytes)
 
     /* Make sure the staging buffer can hold header + command stream */
     if (total_bytes > (uint32_t)sizeof(v3d_cmd_buf)) {
-        serial_printf("virgl: submit_3d overflow total=%u (hdr=%u + payload=%u) buf=%u\n",
-                      total_bytes, (uint32_t)sizeof(*s), size_bytes, (uint32_t)sizeof(v3d_cmd_buf));
+        //serial_printf("virgl: submit_3d overflow total=%u (hdr=%u + payload=%u) buf=%u\n",
+                  //    total_bytes, (uint32_t)sizeof(*s), size_bytes, (uint32_t)sizeof(v3d_cmd_buf));
         return false;
     }
 
@@ -421,8 +422,8 @@ static bool virgl_submit_cmd_buf(uint32_t *cmds, uint32_t size_bytes)
                            (uint32_t)v3d_cmd_buf, total_bytes,
                            (uint32_t)v3d_resp_buf, sizeof(virtio_gpu_ctrl_hdr_t));
     if (head < 0) {
-        serial_printf("virgl: virtio_send submit_3d failed head=%d total_bytes=%u\n",
-                      head, total_bytes);
+        //serial_printf("virgl: virtio_send submit_3d failed head=%d total_bytes=%u\n",
+               //       head, total_bytes);
         return false;
     }
 
@@ -431,8 +432,8 @@ static bool virgl_submit_cmd_buf(uint32_t *cmds, uint32_t size_bytes)
 
     virtio_gpu_ctrl_hdr_t *resp = (virtio_gpu_ctrl_hdr_t *)v3d_resp_buf;
     if (resp->type >= VIRTIO_GPU_RESP_ERR_UNSPEC) {
-        serial_printf("virgl: submit_3d failed resp.type=%x ctx=%u size_bytes=%u total=%u\n",
-                      resp->type, vctx.ctx_id, size_bytes, total_bytes);
+        //serial_printf("virgl: submit_3d failed resp.type=%x ctx=%u size_bytes=%u total=%u\n",
+                  //    resp->type, vctx.ctx_id, size_bytes, total_bytes);
         return false;
     }
 
@@ -451,23 +452,26 @@ bool virgl_cmd_submit(void)
 
     /* Safety: don't overflow the cmd buffer */
     if (size_bytes > vctx.cmd_buf_size) {
-        serial_printf("virgl_cmd_submit: size overflow (bytes=%u > buf=%u) cmd_pos=%u\n",
-                      size_bytes, vctx.cmd_buf_size, vctx.cmd_pos);
+        //serial_printf("virgl_cmd_submit: size overflow (bytes=%u > buf=%u) cmd_pos=%u\n",
+                  //    size_bytes, vctx.cmd_buf_size, vctx.cmd_pos);
         return false;
     }
 
     /* Optional but useful: dump exactly what we are about to submit */
-    virgl_cmd_dump(vctx.cmd_pos);
+ //   virgl_cmd_dump(vctx.cmd_pos);
 
     /*
      * IMPORTANT: SUBMIT_3D size is BYTES (not dwords).
      * virgl_submit_cmd_buf() must send ONLY 'size_bytes' of command data.
      */
     if (!virgl_submit_cmd_buf(vctx.cmd_buf, size_bytes)) {
-        serial_printf("virgl_cmd_submit: SUBMIT_3D failed (bytes=%u words=%u)\n",
-                      size_bytes, vctx.cmd_pos);
+        //serial_printf("virgl_cmd_submit: SUBMIT_3D failed (bytes=%u words=%u)\n",
+                 //     size_bytes, vctx.cmd_pos);
         return false;
     }
+
+    /* Reset command position after successful submit so next batch starts clean */
+    vctx.cmd_pos = 0;
 
     return true;
 }
@@ -490,20 +494,20 @@ static inline uint32_t f2u(float f) {
 bool virgl_init(void) {
     if (vctx.initialized) return true;
 
-    serial_printf("virgl: initializing 3D support...\n");
+    //serial_printf("virgl: initializing 3D support...\n");
 
     /* Verify struct sizes match QEMU expectations */
-serial_printf("virgl: struct sizes: ctrl_hdr=%u(24) ctx_create=%u(96) "
-              "res_create_3d=%u(72) ctx_resource=%u(32) submit3d=%u(32)\n",
-              sizeof(virtio_gpu_ctrl_hdr_t),
-              sizeof(virtio_gpu_ctx_create_t),
-              sizeof(virtio_gpu_resource_create_3d_t),
-              sizeof(virtio_gpu_ctx_resource_t),
-              sizeof(virtio_gpu_cmd_submit_3d_t));
+//serial_printf("virgl: struct sizes: ctrl_hdr=%u(24) ctx_create=%u(96) "
+          //    "res_create_3d=%u(72) ctx_resource=%u(32) submit3d=%u(32)\n",
+           //   sizeof(virtio_gpu_ctrl_hdr_t),
+           //   sizeof(virtio_gpu_ctx_create_t),
+           //   sizeof(virtio_gpu_resource_create_3d_t),
+           //   sizeof(virtio_gpu_ctx_resource_t),
+           //   sizeof(virtio_gpu_cmd_submit_3d_t));
 
-serial_printf("virgl: BUILD_ID=%x\n", VIRGL_BUILD_ID);
-serial_printf("virgl: HDR_TEST=%x\n",
-              VIRGL_CMD_HDR(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_SURFACE, 6));
+//serial_printf("virgl: BUILD_ID=%x\n", VIRGL_BUILD_ID);
+//serial_printf("virgl: HDR_TEST=%x\n",
+          //    VIRGL_CMD_HDR(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_SURFACE, 6));
 
 
 
@@ -521,19 +525,19 @@ serial_printf("virgl: HDR_TEST=%x\n",
      * if already initialized).
      */
     if (!virtio_gpu_init()) {
-        serial_printf("virgl: failed to initialize virtio-gpu device\n");
+        //serial_printf("virgl: failed to initialize virtio-gpu device\n");
         return false;
     }
 
     virtio_dev_t* shared = virtio_gpu_get_device();
     if (!shared) {
-        serial_printf("virgl: virtio-gpu device not initialized\n");
+        //serial_printf("virgl: virtio-gpu device not initialized\n");
         return false;
     }
 
     if (!virtio_gpu_has_virgl()) {
-        serial_printf("virgl: VIRGL feature not available on this device\n");
-        serial_printf("virgl: Make sure QEMU uses: -device virtio-gpu-gl-pci -display gtk,gl=on\n");
+        //serial_printf("virgl: VIRGL feature not available on this device\n");
+        //serial_printf("virgl: Make sure QEMU uses: -device virtio-gpu-gl-pci -display gtk,gl=on\n");
         return false;
     }
 
@@ -541,7 +545,7 @@ serial_printf("virgl: HDR_TEST=%x\n",
     virgl_dev = shared;
     virgl_dev_initialized = true;
 
-    serial_printf("virgl: using shared virtio-gpu device (VIRGL negotiated)\n");
+    //serial_printf("virgl: using shared virtio-gpu device (VIRGL negotiated)\n");
 
     /* Create 3D rendering context */
     if (!virgl_create_context()) {
@@ -549,17 +553,17 @@ serial_printf("virgl: HDR_TEST=%x\n",
     }
 
     /* Allocate the command buffer (page-aligned for DMA) */
-    vctx.cmd_buf = (uint32_t*)kmalloc(65536);  /* 64KB command buffer */
-    if (!vctx.cmd_buf) {
-        serial_printf("virgl: failed to allocate command buffer\n");
-        return false;
-    }
-    vctx.cmd_buf_phys = (uint32_t)vctx.cmd_buf;  /* identity mapped */
-    vctx.cmd_buf_size = 65536;
+  vctx.cmd_buf = (uint32_t*)kmalloc(131072);  /* 128KB — was 64KB, sphere needs ~74KB */
+if (!vctx.cmd_buf) {
+    serial_printf("virgl: failed to allocate command buffer\n");
+    return false;
+}
+vctx.cmd_buf_phys = (uint32_t)vctx.cmd_buf;
+vctx.cmd_buf_size = 131072;
     vctx.cmd_pos = 0;
 
     vctx.initialized = true;
-    serial_printf("virgl: 3D initialization complete!\n");
+    //serial_printf("virgl: 3D initialization complete!\n");
     return true;
 }
 
@@ -633,6 +637,20 @@ static bool virgl_create_shader(uint32_t handle, uint32_t shader_type,
     return virgl_cmd_submit();
 }
 
+void virgl_cmd_disable_depth(void)
+{
+    /* Bind a no-op DSA state: depth disabled, always pass */
+    virgl_cmd_begin();
+    emit(VIRGL_CMD_HDR(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_DSA, 5));
+    emit(200);   /* one-shot temp handle */
+    emit(0);     /* depth_enabled = 0 */
+    emit(0);
+    emit(0);
+    emit(0);
+    emit(VIRGL_CMD_HDR(VIRGL_CCMD_BIND_OBJECT, VIRGL_OBJECT_DSA, 1));
+    emit(200);
+    virgl_cmd_submit();
+}
 
 
 
@@ -645,7 +663,7 @@ bool virgl_setup_pipeline_state(void)
     virgl_ctx_t *vctx = virgl_get_ctx();
     if (!vctx || !vctx->initialized) return false;
 
-    serial_printf("virgl_pipeline: === BEGIN PIPELINE SETUP ===\n");
+    //serial_printf("virgl_pipeline: === BEGIN PIPELINE SETUP ===\n");
 
     uint32_t handle;
 
@@ -660,9 +678,11 @@ bool virgl_setup_pipeline_state(void)
     emit(0);
     emit(0);
   //  emit(0); // last_layer
-    serial_printf("SURFACE COLOR submit (handle=%u res=%u)...\n", handle, vctx->fb_res_id);
-    if (!virgl_cmd_submit()) { serial_printf("SURFACE COLOR FAILED\n"); return false; }
-    serial_printf("SURFACE COLOR OK\n");
+    //serial_printf("SURFACE COLOR submit (handle=%u res=%u)...\n", handle, vctx->fb_res_id);
+    if (!virgl_cmd_submit()) { //serial_printf("SURFACE COLOR FAILED\n"); return false;
+     }
+    //serial_printf("SURFACE COLOR OK\n");
+
 
     /* ---- Depth surface ---- */
     handle = alloc_res_id();
@@ -675,15 +695,16 @@ bool virgl_setup_pipeline_state(void)
     emit(0);
     emit(0);
  //     emit(0); // last_layer
-    serial_printf("SURFACE DEPTH submit (handle=%u res=%u)...\n", handle, vctx->depth_res_id);
-    if (!virgl_cmd_submit()) { serial_printf("SURFACE DEPTH FAILED\n"); return false; }
-    serial_printf("SURFACE DEPTH OK\n");
+    //serial_printf("SURFACE DEPTH submit (handle=%u res=%u)...\n", handle, vctx->depth_res_id);
+    if (!virgl_cmd_submit()) { //serial_printf("SURFACE DEPTH FAILED\n"); return false; 
+    }
+    //serial_printf("SURFACE DEPTH OK\n");
 
     /* ---- Blend ---- */
 //    handle = alloc_res_id();
   //  vctx->blend_handle = 0;
     
-   // serial_printf("BLEND OK\n");
+   // //serial_printf("BLEND OK\n");
 
     handle = alloc_res_id();
     vctx->blend_handle = handle;
@@ -695,9 +716,10 @@ emit(0);           // s1: logicop func
 for (int i = 0; i < 8; i++) {
     emit(0x78000000);  // colormask=0xF (RGBA) in bits[30:27], blend_enable=0
 }
-    serial_printf("BLEND submit (handle=%u len=27)...\n", handle);
-    if (!virgl_cmd_submit()) { serial_printf("BLEND FAILED\n"); return false; }
-    serial_printf("BLEND OK\n");
+    //serial_printf("BLEND submit (handle=%u len=27)...\n", handle);
+    if (!virgl_cmd_submit()) { //serial_printf("BLEND FAILED\n"); return false; 
+    }
+    //serial_printf("BLEND OK\n");
 
 
     /* ---- Rasterizer ---- */
@@ -707,6 +729,7 @@ for (int i = 0; i < 8; i++) {
     emit(VIRGL_CMD_HDR(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_RASTERIZER, 9));
     emit(handle);
     emit((1u << 1));
+ //   emit((1u << 1) | (2u << 8));
     emit(f2u(1.0f));
     emit(0);
     emit(0);
@@ -714,9 +737,10 @@ for (int i = 0; i < 8; i++) {
     emit(0);
     emit(0);
     emit(0);
-    serial_printf("RAST submit (handle=%u len=9)...\n", handle);
-    if (!virgl_cmd_submit()) { serial_printf("RAST FAILED\n"); return false; }
-    serial_printf("RAST OK\n");
+    //serial_printf("RAST submit (handle=%u len=9)...\n", handle);
+    if (!virgl_cmd_submit()) { //serial_printf("RAST FAILED\n"); return false; 
+    }
+    //serial_printf("RAST OK\n");
 
     /* ---- DSA ---- */
     handle = alloc_res_id();
@@ -728,49 +752,55 @@ for (int i = 0; i < 8; i++) {
     emit(0);
     emit(0);
     emit(0);
-    serial_printf("DSA submit (handle=%u len=5)...\n", handle);
-    if (!virgl_cmd_submit()) { serial_printf("DSA FAILED\n"); return false; }
-    serial_printf("DSA OK\n");
+    //serial_printf("DSA submit (handle=%u len=5)...\n", handle);
+    if (!virgl_cmd_submit()) { //serial_printf("DSA FAILED\n"); return false; 
+    }
+    //serial_printf("DSA OK\n");
 
     /* ---- Vertex Elements ---- */
-    handle = alloc_res_id();
-    vctx->ve_handle = handle;
-    virgl_cmd_begin();
-emit(VIRGL_CMD_HDR(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_VERTEX_ELEMENTS, 5));
-emit(handle);       /* word 0: handle */
-emit(0);            /* word 1: src_offset    } element 0 */
-emit(0);            /* word 2: instance_div  }            */
-emit(0);            /* word 3: vb_index      }  4 words  */
-emit(PIPE_FORMAT_R32G32B32A32_FLOAT); /* word 4: format */
-/* num_elements = (5-1)/4 = 1 ✓ */
-    serial_printf("VE submit (handle=%u len=6)...\n", handle);
-    if (!virgl_cmd_submit()) { serial_printf("VE FAILED\n"); return false; }
-    serial_printf("VE OK\n");
+/* ---- Vertex Elements (2 elements: position + color) ---- */
+handle = alloc_res_id();
+vctx->ve_handle = handle;
+virgl_cmd_begin();
+emit(VIRGL_CMD_HDR(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_VERTEX_ELEMENTS, 9));
+emit(handle);
+/* Element 0: position — offset 0, vec4 float */
+emit(0);                            /* src_offset */
+emit(0);                            /* instance_div */
+emit(0);                            /* vb_index */
+emit(PIPE_FORMAT_R32G32B32A32_FLOAT);
+/* Element 1: color — offset 16 (after xyzw), vec4 float */
+emit(16);                           /* src_offset = 4 floats * 4 bytes */
+emit(0);                            /* instance_div */
+emit(0);                            /* vb_index */
+emit(PIPE_FORMAT_R32G32B32A32_FLOAT);
+if (!virgl_cmd_submit()) { //serial_printf("VE FAILED\n"); return false;
+ }
+//serial_printf("VE OK\n");
 
     /* ---- Vertex Shader ---- */
 static const char *vs_dump =
 "VERT\n"
 "DCL IN[0]\n"
+"DCL IN[1]\n"
 "DCL OUT[0], POSITION\n"
-"DCL TEMP[0], LOCAL\n"
-"IMM[0] FLT32 {    0.0000,     1.0000,     0.0000,     0.0000}\n"
-"  0: MOV TEMP[0].zw, IMM[0].yyxy\n"
-"  1: MOV TEMP[0].xy, IN[0].xyxx\n"
-"  2: MOV OUT[0], TEMP[0]\n"
-"  3: END\n";
+"DCL OUT[1], TEXCOORD[0]\n"
+"  0: MOV OUT[0], IN[0]\n"
+"  1: MOV OUT[1], IN[1]\n"
+"  2: END\n";
 
 static const char *fs_dump =
 "FRAG\n"
 "PROPERTY FS_COLOR0_WRITES_ALL_CBUFS 1\n"
+"DCL IN[0], TEXCOORD[0], LINEAR\n"
 "DCL OUT[0], COLOR\n"
-"IMM[0] FLT32 {    1.0000,     0.0000,     0.0000,     0.0000}\n"
-"  0: MOV OUT[0], IMM[0].xyxx\n"
+"  0: MOV OUT[0], IN[0]\n"
 "  1: END\n";
 
 handle = alloc_res_id();
 vctx->vs_handle = handle;
 if (!virgl_create_shader_text(handle, PIPE_SHADER_VERTEX,   vs_dump, 26)){
-    serial_printf("VS FAILED\n");
+    //serial_printf("VS FAILED\n");
     return false;
 }
 
@@ -779,7 +809,7 @@ if (!virgl_create_shader_text(handle, PIPE_SHADER_VERTEX,   vs_dump, 26)){
 handle = alloc_res_id();
 vctx->fs_handle = handle;
 if  (!virgl_create_shader_text(handle, PIPE_SHADER_FRAGMENT, fs_dump, 16)) {
-    serial_printf("FS FAILED\n");
+    //serial_printf("FS FAILED\n");
     return false;
 }
 
@@ -794,7 +824,7 @@ vctx->vs_handle = handle;
 
 
 
-serial_printf("VS submit (handle=%u) [BINARY TGSI]...\n", handle);
+//serial_printf("VS submit (handle=%u) [BINARY TGSI]...\n", handle);
 if (!virgl_create_shader(handle, PIPE_SHADER_VERTEX,
                          as_u32(vs_bin), vs_tokens)){ return false;}
   
@@ -802,7 +832,7 @@ if (!virgl_create_shader(handle, PIPE_SHADER_VERTEX,
 handle = alloc_res_id();
 vctx->fs_handle = handle;
 
-serial_printf("FS submit (handle=%u) [BINARY TGSI]...\n", handle);
+//serial_printf("FS submit (handle=%u) [BINARY TGSI]...\n", handle);
 if (!virgl_create_shader(handle, PIPE_SHADER_FRAGMENT,
                          as_u32(fs_bin), fs_tokens)){ return false;}
    
@@ -830,14 +860,14 @@ if (!virgl_create_shader(handle, PIPE_SHADER_FRAGMENT,
     emit(vctx->depth_surface_handle);
     emit(vctx->color_surface_handle);
 
-    emit(VIRGL_CMD_HDR(VIRGL_CCMD_SET_VIEWPORT_STATE, 0, 7));
-    emit(0);
-    emit(f2u(vctx->fb_width  / 2.0f));
-    emit(f2u(vctx->fb_height / 2.0f));
-    emit(f2u(1.0f));
-    emit(f2u(vctx->fb_width  / 2.0f));
-    emit(f2u(vctx->fb_height / 2.0f));
-    emit(f2u(0.0f));
+emit(VIRGL_CMD_HDR(VIRGL_CCMD_SET_VIEWPORT_STATE, 0, 7));
+emit(0);                                     // viewport index
+emit(f2u(vctx->fb_width  / 2.0f));          // scale.x = 160
+emit(f2u(-(vctx->fb_height / 2.0f)));        // scale.y = -100  ← NEGATIVE, fixes Y flip
+emit(f2u(0.5f));                             // scale.z = 0.5   ← maps NDC[-1,1]→[0,1]
+emit(f2u(vctx->fb_width  / 2.0f));          // translate.x = 160
+emit(f2u(vctx->fb_height / 2.0f));          // translate.y = 100
+emit(f2u(0.5f));                             // translate.z = 0.5 ← centre of [0,1]
 
     emit(VIRGL_CMD_HDR(VIRGL_CCMD_SET_SCISSOR_STATE, 0, 3));
     emit(0);
@@ -845,19 +875,20 @@ if (!virgl_create_shader(handle, PIPE_SHADER_FRAGMENT,
     emit(((uint32_t)vctx->fb_width) | ((uint32_t)vctx->fb_height << 16));
 
 emit(VIRGL_CMD_HDR(VIRGL_CCMD_SET_VERTEX_BUFFERS, 0, 3));
-emit(28);              /* stride */
+emit(32);              /* stride = 8 floats * 4 bytes = 32 */
 emit(0);               /* offset */
 emit(vctx->vbo_res_id);
 
-    serial_printf("BIND+STATE submit...\n");
-    if (!virgl_cmd_submit()) { serial_printf("BIND+STATE FAILED\n"); return false; }
-    serial_printf("BIND+STATE OK\n");
+    //serial_printf("BIND+STATE submit...\n");
+    if (!virgl_cmd_submit()) { //serial_printf("BIND+STATE FAILED\n"); return false;
+     }
+    //serial_printf("BIND+STATE OK\n");
 
-    serial_printf("virgl_pipeline: === PIPELINE SETUP COMPLETE ===\n");
-    serial_printf("  surfaces: color=%u depth=%u\n", vctx->color_surface_handle, vctx->depth_surface_handle);
-    serial_printf("  state: blend=%u rast=%u dsa=%u ve=%u vs=%u fs=%u\n",
-                  vctx->blend_handle, vctx->rasterizer_handle, vctx->dsa_handle,
-                  vctx->ve_handle, vctx->vs_handle, vctx->fs_handle);
+    //serial_printf("virgl_pipeline: === PIPELINE SETUP COMPLETE ===\n");
+    //serial_printf("  surfaces: color=%u depth=%u\n", vctx->color_surface_handle, vctx->depth_surface_handle);
+    //serial_printf("  state: blend=%u rast=%u dsa=%u ve=%u vs=%u fs=%u\n",
+              //    vctx->blend_handle, vctx->rasterizer_handle, vctx->dsa_handle,
+                //  vctx->ve_handle, vctx->vs_handle, vctx->fs_handle);
     return true;
 }
 
@@ -875,7 +906,7 @@ bool virgl_setup_framebuffer(uint16_t width, uint16_t height)
      * 1) COLOR BUFFER (3D texture, render target)
      * ------------------------------------------------------------ */
     vctx.fb_res_id = alloc_res_id();
-    serial_printf("virgl: creating 3D color buffer resource %u\n", vctx.fb_res_id);
+    //serial_printf("virgl: creating 3D color buffer resource %u\n", vctx.fb_res_id);
 
 if (!virgl_create_resource_3d(vctx.fb_res_id,
                               PIPE_TEXTURE_2D,
@@ -894,11 +925,11 @@ if (!virgl_create_resource_3d(vctx.fb_res_id,
 
     uint32_t fb_phys = virt_to_phys(fb_mem);
     if (!virgl_attach_backing(vctx.fb_res_id, fb_phys, fb_size)) {
-        serial_printf("virgl: failed to attach backing to color buffer\n");
+        //serial_printf("virgl: failed to attach backing to color buffer\n");
         return false;
     }
     if (!virgl_ctx_attach(vctx.fb_res_id)) {
-        serial_printf("virgl: failed to attach fb resource %u to context\n", vctx.fb_res_id);
+        //serial_printf("virgl: failed to attach fb resource %u to context\n", vctx.fb_res_id);
         return false;
     }
 
@@ -906,7 +937,7 @@ if (!virgl_create_resource_3d(vctx.fb_res_id,
      * 2) DEPTH BUFFER (3D texture, depth/stencil)
      * ------------------------------------------------------------ */
     vctx.depth_res_id = alloc_res_id();
-    serial_printf("virgl: creating depth buffer resource %u\n", vctx.depth_res_id);
+    //serial_printf("virgl: creating depth buffer resource %u\n", vctx.depth_res_id);
 
 if (!virgl_create_resource_3d(vctx.depth_res_id,
                               PIPE_TEXTURE_2D,
@@ -927,11 +958,11 @@ if (!virgl_create_resource_3d(vctx.depth_res_id,
 
     uint32_t depth_phys = virt_to_phys(depth_mem);
     if (!virgl_attach_backing(vctx.depth_res_id, depth_phys, depth_size)) {
-        serial_printf("virgl: failed to attach backing to depth buffer\n");
+        //serial_printf("virgl: failed to attach backing to depth buffer\n");
         return false;
     }
     if (!virgl_ctx_attach(vctx.depth_res_id)) {
-        serial_printf("virgl: failed to attach depth resource %u to context\n", vctx.depth_res_id);
+        //serial_printf("virgl: failed to attach depth resource %u to context\n", vctx.depth_res_id);
         return false;
     }
 
@@ -940,7 +971,7 @@ if (!virgl_create_resource_3d(vctx.depth_res_id,
      * ------------------------------------------------------------ */
     vctx.vbo_size   = 256 * 1024;
     vctx.vbo_res_id = alloc_res_id();
-    serial_printf("virgl: creating VBO resource %u\n", vctx.vbo_res_id);
+    //serial_printf("virgl: creating VBO resource %u\n", vctx.vbo_res_id);
 
     if (!virgl_create_resource_3d(vctx.vbo_res_id,
                                   PIPE_BUFFER,
@@ -948,7 +979,7 @@ if (!virgl_create_resource_3d(vctx.depth_res_id,
                                   VIRGL_BIND_VERTEX_BUFFER,
                                   vctx.vbo_size, 1, 1))
     {
-        serial_printf("virgl: failed to create VBO\n");
+        //serial_printf("virgl: failed to create VBO\n");
         return false;
     }
 
@@ -960,11 +991,11 @@ if (!virgl_create_resource_3d(vctx.depth_res_id,
 
     uint32_t vbo_phys = virt_to_phys(vbo_mem);
     if (!virgl_attach_backing(vctx.vbo_res_id, vbo_phys, vctx.vbo_size)) {
-        serial_printf("virgl: failed to attach backing to VBO\n");
+        //serial_printf("virgl: failed to attach backing to VBO\n");
         return false;
     }
     if (!virgl_ctx_attach(vctx.vbo_res_id)) {
-        serial_printf("virgl: failed to attach vbo resource %u to context\n", vctx.vbo_res_id);
+        //serial_printf("virgl: failed to attach vbo resource %u to context\n", vctx.vbo_res_id);
         return false;
     }
 
@@ -972,7 +1003,7 @@ if (!virgl_create_resource_3d(vctx.depth_res_id,
      * 4) DISPLAY (3D texture used as scanout resource)
      * ------------------------------------------------------------ */
     vctx.display_res_id = alloc_res_id();
-    serial_printf("virgl: creating 3D display resource %u for scanout\n", vctx.display_res_id);
+    //serial_printf("virgl: creating 3D display resource %u for scanout\n", vctx.display_res_id);
 
 virtio_gpu_resource_create_2d_t cmd;
 memset(&cmd, 0, sizeof(cmd));
@@ -984,7 +1015,7 @@ cmd.width  = width;
 cmd.height = height;
 
 if (!gpu3d_cmd_ok(&cmd, sizeof(cmd))) {
-    serial_printf("display CREATE_2D failed\n");
+    //serial_printf("display CREATE_2D failed\n");
     return false;
 }
 
@@ -998,14 +1029,14 @@ if (!gpu3d_cmd_ok(&cmd, sizeof(cmd))) {
 
     uint32_t display_phys = virt_to_phys(display_mem);
     if (!virgl_attach_backing(vctx.display_res_id, display_phys, fb_size)) {
-        serial_printf("virgl: failed to attach backing to display resource\n");
+        //serial_printf("virgl: failed to attach backing to display resource\n");
         return false;
     }
 
 
 // ADD THIS:
 if (!virgl_ctx_attach(vctx.display_res_id)) {
-    serial_printf("virgl: failed to attach display resource %u to context\n", vctx.display_res_id);
+    //serial_printf("virgl: failed to attach display resource %u to context\n", vctx.display_res_id);
     return false;
 }
 
@@ -1024,13 +1055,13 @@ if (!virgl_ctx_attach(vctx.display_res_id)) {
     scanout.resource_id = vctx.display_res_id;
 
     if (!gpu3d_cmd_ok(&scanout, sizeof(scanout))) {
-        serial_printf("virgl: SET_SCANOUT FAILED for resource %u!\n", vctx.display_res_id);
+        //serial_printf("virgl: SET_SCANOUT FAILED for resource %u!\n", vctx.display_res_id);
         return false;
     }
-    serial_printf("virgl: SET_SCANOUT succeeded for resource %u\n", vctx.display_res_id);
+    //serial_printf("virgl: SET_SCANOUT succeeded for resource %u\n", vctx.display_res_id);
 
-    serial_printf("virgl: framebuffer %ux%u set up (color=%u, depth=%u, vbo=%u, display=%u)\n",
-                  width, height, vctx.fb_res_id, vctx.depth_res_id, vctx.vbo_res_id, vctx.display_res_id);
+    //serial_printf("virgl: framebuffer %ux%u set up (color=%u, depth=%u, vbo=%u, display=%u)\n",
+               //   width, height, vctx.fb_res_id, vctx.depth_res_id, vctx.vbo_res_id, vctx.display_res_id);
 
     return true;
 }
@@ -1052,11 +1083,11 @@ void virgl_cmd_begin(void)
 {
 
 
-    serial_printf("VIRGL_BUILD_ID=%x HDR_TEST=%x\n",
-              VIRGL_BUILD_ID,
-              VIRGL_CMD_HDR(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_SURFACE, 6));
+    //serial_printf("VIRGL_BUILD_ID=%x HDR_TEST=%x\n",
+           //   VIRGL_BUILD_ID,
+             // VIRGL_CMD_HDR(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_SURFACE, 6));
     vctx.cmd_pos = 0;
-    serial_printf("CMD_BEGIN: reset cmd_pos=0\n");
+    //serial_printf("CMD_BEGIN: reset cmd_pos=0\n");
 }
 
 
@@ -1064,13 +1095,13 @@ void virgl_cmd_begin(void)
 void virgl_cmd_set_viewport(uint32_t w, uint32_t h)
 {
     emit(VIRGL_CMD_HDR(VIRGL_CCMD_SET_VIEWPORT_STATE, 0, 7));
-    emit(0);                // viewport index
-    emit(f2u(w / 2.0f));    // scale.x
-    emit(f2u(h / 2.0f));    // scale.y
-    emit(f2u(1.0f));        // scale.z
-    emit(f2u(w / 2.0f));    // translate.x
-    emit(f2u(h / 2.0f));    // translate.y
-    emit(f2u(0.0f));        // translate.z
+    emit(0);
+    emit(f2u(w / 2.0f));
+    emit(f2u(-(h / 2.0f)));   // negative
+    emit(f2u(0.5f));
+    emit(f2u(w / 2.0f));
+    emit(f2u(h / 2.0f));
+    emit(f2u(0.5f));
 }
 
 static inline void emit_u64(uint64_t v) {
@@ -1084,20 +1115,21 @@ static inline uint64_t d2u(double d) {
     return x.u;
 }
 
-void virgl_cmd_clear(uint32_t buffers,
-                     float r, float g, float b, float a,
+void virgl_cmd_clear(uint32_t buffers, float r, float g, float b, float a,
                      double depth, uint32_t stencil)
 {
+    /* NOTE: Just emits into the command buffer — caller is responsible for
+     * virgl_cmd_begin() before and virgl_cmd_submit() after.
+     * This allows batching clear + draw commands into a single submit. */
     emit(VIRGL_CMD_HDR(VIRGL_CCMD_CLEAR, 0, 8));
     emit(buffers);
     emit(f2u(r));
     emit(f2u(g));
     emit(f2u(b));
     emit(f2u(a));
-    emit_u64(d2u(depth));   // 2 dwords
+    emit_u64(d2u(depth));
     emit(stencil);
 }
-
 
 
 /*
@@ -1223,7 +1255,7 @@ void virgl_present(void)
     emit(1);
 
     if (!virgl_cmd_submit()) {
-        serial_printf("virgl_present: COPY_REGION failed\n");
+        //serial_printf("virgl_present: COPY_REGION failed\n");
         return;
     }
 
@@ -1239,7 +1271,7 @@ void virgl_present(void)
     flush.r.height = vctx.fb_height;
 
     if (!gpu3d_cmd_ok(&flush, sizeof(flush))) {
-        serial_printf("virgl_present: RESOURCE_FLUSH failed\n");
+        //serial_printf("virgl_present: RESOURCE_FLUSH failed\n");
     }
 }
 
@@ -1258,7 +1290,7 @@ void virgl_shutdown(void) {
     if (vctx.cmd_buf) kfree(vctx.cmd_buf);
     memset(&vctx, 0, sizeof(vctx));
 
-    serial_printf("virgl: shutdown complete\n");
+    //serial_printf("virgl: shutdown complete\n");
 }
 
 

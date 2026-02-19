@@ -298,4 +298,6 @@ uint32_t* virgl_get_display_backing(void);
 bool virgl_setup_pipeline_state(void);
 void virgl_cmd_set_viewport(uint32_t w, uint32_t h);
 
+void virgl_cmd_disable_depth(void);
+void virgl_set_depth_test(uint32_t enabled);
 #endif /* VIRGL_H */

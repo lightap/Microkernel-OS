@@ -522,6 +522,15 @@ static bool start_menu_open = false;
 static bool gui_running = true;
 static bool dragging = false;
 
+/* ====== DIRTY TRACKING ======
+ * Skip expensive full-screen redraws + 8MB blit when nothing changed.
+ * Mark dirty on: mouse movement, keyboard input, window changes, ELF frame updates.
+ */
+static bool needs_redraw = true;
+static int  prev_mouse_x = -1, prev_mouse_y = -1;
+
+static void gui_mark_dirty(void) { needs_redraw = true; }
+
 /* GL3D window rendering */
 #define GL_WIN_W 384
 #define GL_WIN_H 280
@@ -590,6 +599,7 @@ static int open_window(const char* title, int x, int y, int w, int h, app_type_t
     bring_to_front(idx);
     
     serial_printf("GUI: open_window complete, returning %d\n", focus_idx);
+    gui_mark_dirty();
     return focus_idx;
 }
 static void close_window(int idx) {
@@ -598,6 +608,7 @@ static void close_window(int idx) {
     focus_idx = -1;
     for (int i = MAX_WINDOWS - 1; i >= 0; i--)
         if (windows[i].active) { windows[i].focused = true; focus_idx = i; break; }
+    gui_mark_dirty();
 }
 
 /* ====== HELPERS ====== */
@@ -2024,6 +2035,7 @@ void gui_elf_win_present(uint32_t pid) {
      * and pick up the new frame from the display backing.
      */
     (void)pid;
+    gui_mark_dirty();
     task_yield();
 }
 
@@ -2239,8 +2251,7 @@ static void draw_desktop(void) {
 
     if (wallpaper_loaded && wallpaper) {
         uint32_t n = (uint32_t)GFX_W * desk_h;
-        for (uint32_t i = 0; i < n; i++)
-            backbuf[i] = wallpaper[i];
+        memcpy(backbuf, wallpaper, n * sizeof(uint32_t));
         return;
     }
 
@@ -2711,10 +2722,12 @@ static void handle_mouse(void) {
             if (windows[drag_idx].y < 0) windows[drag_idx].y = 0;
             if (windows[drag_idx].y > GFX_H - TASKBAR_H - TITLEBAR_H)
                 windows[drag_idx].y = GFX_H - TASKBAR_H - TITLEBAR_H;
-        } else { dragging = false; drag_idx = -1; }
+            gui_mark_dirty();
+        } else { dragging = false; drag_idx = -1; gui_mark_dirty(); }
         return;
     }
     if (!lclick) return;
+    gui_mark_dirty();  /* Any click causes a visual change */
     if (start_menu_open) { handle_start_click(mx, my); return; }
     if (my >= GFX_H - TASKBAR_H) {
         if (mx >= 2 && mx < 2 + START_BTN_W && my >= GFX_H - TASKBAR_H + 3) {
@@ -2756,6 +2769,7 @@ static void handle_mouse(void) {
 
 static void handle_keyboard(void) {
     if (!keyboard_haskey()) return;
+    gui_mark_dirty();  /* Any keystroke causes a visual change */
     char key = keyboard_getchar();
     if (key == 27) { if (start_menu_open) start_menu_open = false; return; }
     if (focus_idx >= 0 && windows[focus_idx].active) {
@@ -2925,14 +2939,41 @@ void gui_start(void) {
     gui_running = true;
     dragging = false;
     start_btn_hover = false;
+    needs_redraw = true;
+    prev_mouse_x = -1;
+    prev_mouse_y = -1;
 
     load_wallpaper();
 
     while (gui_running) {
         mouse_poll();
+
+        /* Check if mouse moved — if so, must redraw (cursor position changed) */
+        {
+            int mx = mouse_get_x(), my = mouse_get_y();
+            if (mx != prev_mouse_x || my != prev_mouse_y) {
+                prev_mouse_x = mx;
+                prev_mouse_y = my;
+                gui_mark_dirty();
+            }
+        }
+
         handle_mouse();
         handle_keyboard();
-        render();
+
+        /* Active ELF GL windows are continuously animating — always redraw */
+        for (int i = 0; i < MAX_WINDOWS; i++) {
+            if (windows[i].active && windows[i].app == APP_ELF_GL) {
+                gui_mark_dirty();
+                break;
+            }
+        }
+
+        /* Only redraw + blit when something actually changed */
+        if (needs_redraw) {
+            render();
+            needs_redraw = false;
+        }
 
         task_sleep(10);
     }
