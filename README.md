@@ -96,5 +96,5 @@ qemu-system-i386 -kernel microkernel.bin -m 128M \
 - **DNS resolution** — `nslookup google.com` resolves hostnames to IP addresses
 
 ## License
-copyright andrew pliatsikas 2026
+copyright andrew pliatsikas
 BSD LICENSE

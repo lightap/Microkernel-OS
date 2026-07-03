@@ -32,6 +32,7 @@
 #define ENOMEM   12   /* Out of memory */
 #define EFAULT   14   /* Bad address / invalid pointer */
 #define EINVAL   22   /* Invalid argument */
+#define EBUSY    16   /* Device or resource busy */
 
 int copy_from_user(void* to, const void* from, uint32_t size);
 
@@ -255,6 +256,31 @@ case SYS_VIRGL_SUBMIT: {
         uint32_t h = arg2 ? arg2 : 200;
         //serial_printf("GPU3D: init %ux%u\n", w, h);
 
+        /* With the compiz compositor active, the app gets its own virgl
+         * sub-context and renders into a window instead of taking over
+         * the scanout. */
+        if (virgl_compiz_active()) {
+            if (!virgl_app_windowed_begin((uint16_t)w, (uint16_t)h)) {
+                serial_printf("GPU3D: windowed init refused (app already active?)\n");
+                regs->eax = (uint32_t)-EBUSY;
+                break;
+            }
+            bool ok = virgl_setup_framebuffer((uint16_t)w, (uint16_t)h)
+                   && virgl_setup_pipeline_state();
+            if (ok) virgl_cmd_set_viewport((uint16_t)w, (uint16_t)h);
+            virgl_app_windowed_commit(ok);
+            if (!ok) {
+                serial_printf("GPU3D: windowed setup failed\n");
+                regs->eax = (uint32_t)-1;
+                break;
+            }
+            /* Grow the app's desktop window to fit its framebuffer */
+            gui_elf_win_resize(task_get_current()->id, (uint16_t)w, (uint16_t)h);
+            serial_printf("GPU3D: windowed init OK (%ux%u, sub-ctx)\n", w, h);
+            regs->eax = 0;
+            break;
+        }
+
         if (!virgl_init()) {
             //serial_printf("GPU3D: virgl_init FAILED\n");
             regs->eax = (uint32_t)-1;
@@ -358,11 +384,10 @@ case SYS_GPU3D_DRAW: {
 
     case SYS_GPU3D_PRESENT: {
         //serial_printf("GPU3D_PRESENT: starting present\n");
-        
-        /* 1. Submit the entire batched frame (clear + uploads + draws) in ONE round-trip */
-        virgl_cmd_submit();
-        
-        /* 2. Copy rendered result to scanout + flush (2 more round-trips) */
+
+        /* Submit the entire batched frame (clear + uploads + draws +
+         * copy-to-display) in ONE round-trip, then flush the scanout
+         * (second round-trip). virgl_present() handles both. */
         virgl_present();
         
         //serial_printf("GPU3D_PRESENT: virgl_present done\n");
@@ -370,16 +395,60 @@ case SYS_GPU3D_DRAW: {
         /* 3. Notify GUI that frame is ready */
         task_t* t = task_get_current();
         gui_elf_win_present(t->id);
-        
-        /* 
-         * 4. Sleep for 1 tick (10ms). This limits the app to 100 FPS
-         * and gives the GUI loop enough time to blit the frame
-         * to the actual VGA screen.
+
+        /* Perf report: one serial line per second breaking down where the
+         * time goes. submit/flush %% are the two GPU round-trips (including
+         * their virtio_wait); "guest" is everything else (app CPU, syscalls,
+         * command building, other tasks). waits: fast = resolved during the
+         * spin window, slow = fell back to tick-yield, ticks = 10ms timer
+         * ticks burned inside virtio_wait this second. */
+        {
+            extern uint64_t virgl_stat_submit_tsc, virgl_stat_flush_tsc;
+            extern uint32_t virtio_stat_wait_fast, virtio_stat_wait_slow,
+                            virtio_stat_wait_ticks;
+            static uint32_t fps_frames = 0;
+            static uint32_t fps_last   = 0;
+            static uint64_t tsc_last   = 0;
+
+            fps_frames++;
+            uint32_t now = timer_get_ticks();
+            if (now - fps_last >= 100) {   /* 100 ticks @ 100Hz = 1s */
+                uint64_t tsc_now = rdtsc();
+                /* >>16 keeps everything in 32-bit range (avoids __udivdi3,
+                 * which isn't linkable with -lgcc before the objects) */
+                uint32_t window  = (uint32_t)((tsc_now - tsc_last) >> 16);
+                uint32_t sub32   = (uint32_t)(virgl_stat_submit_tsc >> 16);
+                uint32_t flu32   = (uint32_t)(virgl_stat_flush_tsc  >> 16);
+                uint32_t sub_pct = 0, flu_pct = 0, oth_pct = 0;
+                if (window && tsc_last) {
+                    sub_pct = (sub32 * 100) / window;
+                    flu_pct = (flu32 * 100) / window;
+                    if (sub_pct > 100) sub_pct = 100;
+                    if (flu_pct > 100 - sub_pct) flu_pct = 100 - sub_pct;
+                    oth_pct = 100 - sub_pct - flu_pct;
+                }
+                serial_printf("gpu3d: %u FPS | submit %u%% flush %u%% guest %u%% | waits fast=%u slow=%u ticks=%u\n",
+                              (fps_frames * 100) / (now - fps_last),
+                              sub_pct, flu_pct, oth_pct,
+                              virtio_stat_wait_fast, virtio_stat_wait_slow,
+                              virtio_stat_wait_ticks);
+                fps_frames = 0;
+                fps_last   = now;
+                tsc_last   = tsc_now;
+                virgl_stat_submit_tsc = 0;
+                virgl_stat_flush_tsc  = 0;
+                virtio_stat_wait_fast = 0;
+                virtio_stat_wait_slow = 0;
+                virtio_stat_wait_ticks = 0;
+            }
+        }
+
+        /*
+         * 4. No yield here. task_yield() halts until the next 100Hz
+         * timer tick, so it cost up to 10ms per frame. The preemptive
+         * scheduler already time-slices this task fairly, and the GUI
+         * is in standby while we own the scanout.
          */
-        t->state = TASK_SLEEPING;
-        t->wake_tick = timer_get_ticks() + 1; 
-        task_yield();
-        
         regs->eax = 0;
         break;
     }

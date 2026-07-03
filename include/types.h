@@ -45,6 +45,11 @@ static inline void io_wait(void) {
 static inline void cli(void) { __asm__ volatile ("cli"); }
 static inline void sti(void) { __asm__ volatile ("sti"); }
 static inline void hlt(void) { __asm__ volatile ("hlt"); }
+static inline uint64_t rdtsc(void) {
+    uint32_t lo, hi;
+    __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
 
 /* String utilities */
 static inline size_t strlen(const char* s) {

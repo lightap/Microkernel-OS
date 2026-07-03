@@ -4,8 +4,8 @@
 void serial_init(uint16_t port) {
     outb(port + 1, 0x00);    /* Disable interrupts */
     outb(port + 3, 0x80);    /* Enable DLAB */
-    outb(port + 0, 0x03);    /* Baud 38400 (lo) */
-    outb(port + 1, 0x00);    /* Baud 38400 (hi) */
+    outb(port + 0, 0x01);    /* Baud 115200 (divisor lo) — was 38400 */
+    outb(port + 1, 0x00);    /* Baud 115200 (divisor hi) */
     outb(port + 3, 0x03);    /* 8 bits, no parity, 1 stop */
     outb(port + 2, 0xC7);    /* Enable FIFO, 14-byte threshold */
     outb(port + 4, 0x0B);    /* IRQs enabled, RTS/DSR set */

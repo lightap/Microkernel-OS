@@ -206,6 +206,7 @@ void virtio_gpu_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h);
 
 /* Flush the entire screen */
 void virtio_gpu_flush_all(void);
+void virtio_gpu_restore_scanout(void);
 
 /* Disable / clean up the GPU */
 void virtio_gpu_disable(void);

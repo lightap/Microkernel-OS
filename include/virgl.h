@@ -58,12 +58,14 @@ typedef struct __attribute__((packed)) virtio_gpu_cmd_submit_3d {
     uint32_t size;              /* SIZE IN BYTES (virtio-gpu) */
     uint32_t padding;           /* required */
 } virtio_gpu_cmd_submit_3d_t;
+/* (TRANSFER_TO_HOST_3D struct comes from virtio_gpu.h: virtio_gpu_transfer_host_3d_t) */
 
 _Static_assert(sizeof(virtio_gpu_ctrl_hdr_t) == 24, "ctrl_hdr must be 24 bytes");
 _Static_assert(sizeof(virtio_gpu_ctx_create_t) == 96, "ctx_create must be 96 bytes");
 _Static_assert(sizeof(virtio_gpu_resource_create_3d_t) == 72, "res_create_3d must be 72 bytes");
 _Static_assert(sizeof(virtio_gpu_ctx_resource_t) == 32, "ctx_resource must be 32 bytes");
 _Static_assert(sizeof(virtio_gpu_cmd_submit_3d_t) == 32, "SUBMIT_3D must be 32 bytes");
+
 
 /* ============================================================
  * Virgl commands (CCMD)
@@ -293,6 +295,59 @@ void virgl_cmd_set_constant_buffer(uint32_t shader_type,
 bool virgl_cmd_submit(void);
 void virgl_present(void);
 void virgl_shutdown(void);
+bool virgl_scanout_active(void);
+
+/* ===== "compiz" GPU-composited desktop mode =====
+ * The desktop is CPU-rendered into a guest buffer (identical pixels to the
+ * classic path), which backs a virgl GPU texture. Each frame the dirty band
+ * is DMA'd to the texture and composited to the display resource by the
+ * host GPU (COPY_REGION executes as a GL blit in virglrenderer). */
+bool virgl_compiz_init(uint16_t w, uint16_t h, void* backing);
+bool virgl_compiz_active(void);
+void virgl_compiz_present(uint32_t y0, uint32_t band_h);
+void virgl_compiz_shutdown(void);
+
+/* ===== GPU scene renderer: the desktop drawn BY the GPU =====
+ * Chrome (background, frames, titlebars, text, cursor) is submitted as
+ * triangle geometry each frame; CPU-rendered content rectangles (window
+ * clients, taskbar, menus) are composited on top from the desktop texture. */
+typedef struct {
+    int x, y, w, h;
+    int src;   /* 0 = CPU desktop texture (content), 1 = GPU chrome fb */
+} virgl_rect_t;
+void virgl_scene_begin(void);
+void virgl_scene_quad(int x, int y, int w, int h, uint32_t rgb);
+void virgl_scene_quad4(int x, int y, int w, int h,
+                       uint32_t c00, uint32_t c10, uint32_t c11, uint32_t c01);
+void virgl_scene_tri(int x0, int y0, int x1, int y1, int x2, int y2, uint32_t rgb);
+uint32_t virgl_scene_free_verts(void);
+bool virgl_scene_flush(void);
+bool virgl_scene_available(void);
+/* Textured triangle: positions AND texel coords in desktop pixels; UVs
+ * sample the desktop texture (used by the wobbly-window warp). */
+void virgl_scene_tex_tri(float px0, float py0, float tx0, float ty0,
+                         float px1, float py1, float tx1, float ty1,
+                         float px2, float py2, float tx2, float ty2);
+bool virgl_pipeline_setup_texturing(uint32_t tex_res_id);
+void virgl_compiz_enable_texturing(bool on);
+uint32_t virgl_pipeline_fs_plain(void);
+uint32_t virgl_pipeline_fs_tex(void);
+void virgl_compiz_compose(const virgl_rect_t* rects, uint32_t nrects);
+void virgl_compiz_upload_band(const uint32_t* src, uint32_t y0, uint32_t band_h);
+void virgl_compiz_set_flip(bool f);
+bool virgl_compiz_get_flip(void);
+
+/* ===== Windowed GL apps (per-app virgl sub-contexts) =====
+ * With compiz active, a GL app renders in its own sub-context into its
+ * own texture; the result is read back and composited as a desktop
+ * window instead of taking over the scanout. */
+bool virgl_app_windowed_begin(uint16_t w, uint16_t h);
+void virgl_app_windowed_commit(bool ok);
+bool virgl_app_windowed_active(void);
+void virgl_app_windowed_end(void);
+uint32_t* virgl_app_backing(uint16_t* w, uint16_t* h);
+void virgl_lock_gpu(void);
+void virgl_unlock_gpu(void);
 
 uint32_t* virgl_get_display_backing(void);
 bool virgl_setup_pipeline_state(void);

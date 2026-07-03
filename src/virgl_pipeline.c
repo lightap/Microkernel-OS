@@ -821,3 +821,147 @@ void virgl_pipeline_set_depth_test(bool enable) {
 
     ctx->dsa_handle = new_dsa;
 }
+/* ================================================================
+ *  TEXTURE SAMPLING (for the compiz wobbly-window warp)
+ *
+ *  A second fragment shader samples SAMP[0] using the interpolated
+ *  "color" attribute's .xy as texture coordinates — so the existing
+ *  vertex format (pos + color) carries UVs with zero vertex-element
+ *  changes. The desktop texture is bound as sampler view 0 with a
+ *  linear-filtering sampler state.
+ * ================================================================ */
+
+/* Minimal classic form: no SVIEW declaration (old tgsi_text parsers
+ * don't know it — the host EINVAL'd the richer variant), no TEMP, no
+ * IMM. TEX straight to OUT[0] with legacy SAMP-only sampling, which is
+ * exactly the style this vintage of virglrenderer grew up with. */
+static const char fs_tex_tgsi_text[] =
+    "FRAG\n"
+    "DCL IN[0], GENERIC[0], PERSPECTIVE\n"
+    "DCL OUT[0], COLOR\n"
+    "DCL SAMP[0]\n"
+    "  0: TEX OUT[0], IN[0], SAMP[0], 2D\n"
+    "  1: END\n";
+
+static uint32_t fs_tex_handle = 0;
+
+uint32_t virgl_pipeline_fs_plain(void) {
+    virgl_ctx_t* ctx = virgl_get_ctx();
+    return ctx ? ctx->fs_handle : 0;
+}
+
+uint32_t virgl_pipeline_fs_tex(void) {
+    return fs_tex_handle;
+}
+
+/* Create + bind everything texture sampling needs, in the CURRENT
+ * sub-context. Called once at compiz init (sub-context 0). One batch. */
+bool virgl_pipeline_setup_texturing(uint32_t tex_res_id) {
+    /* emit() in this file uses the FILE-SCOPE ctx pointer — assign it,
+     * don't shadow it with a local (a shadow left it NULL and every
+     * command below silently vanished; the submit then succeeded with
+     * an empty batch and reported a false "ready"). */
+    ctx = virgl_get_ctx();
+    if (!ctx || !ctx->initialized) return false;
+
+    virgl_cmd_begin();
+
+    /*
+     * PRIVATE HANDLE RANGE (9000+): the shared alloc_handle() counter
+     * proved unreliable here — the v16 log showed this shader getting
+     * handle 10, the allocator's FIRST value, colliding with an object
+     * pipeline setup already created. CREATE_OBJECT on an existing
+     * handle is a decode error that can kill the whole virgl context
+     * (= black screen). Fixed handles far above the allocator avoid
+     * the collision no matter what state the counter is in.
+     */
+    /* Proven 4-word packet layout (identical to the pipeline's working
+     * shaders on this host) + private handle 9000 (avoids the allocator
+     * weirdness seen in v16) + minimal legacy TGSI text. The earlier
+     * failure was the TEXT (DCL SVIEW etc. is too modern for this
+     * host's parser), not the layout. */
+    fs_tex_handle = 9000;
+    {
+        uint32_t text_len = 0;
+        while (fs_tex_tgsi_text[text_len]) text_len++;
+        text_len++;
+        uint32_t text_words = (text_len + 3) / 4;
+        emit(VIRGL_CMD_HDR(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_SHADER,
+                           4 + text_words));
+        emit(fs_tex_handle);
+        emit(PIPE_SHADER_FRAGMENT);
+        emit(0);            /* num_tokens (as the working shaders pass) */
+        emit(0);            /* offlen     (as the working shaders pass) */
+        emit_string(fs_tex_tgsi_text);
+    }
+    if (!virgl_cmd_submit()) {
+        serial_printf("virgl_pipeline: TEX-FS shader create REJECTED\n");
+        fs_tex_handle = 0;
+        return false;
+    }
+    serial_printf("virgl_pipeline: tex FS created (handle 9000)\n");
+    virgl_cmd_begin();
+
+    /* Sampler view over the desktop texture (2D, single level/layer,
+     * identity swizzle 0x688 = R,G,B,A) */
+    uint32_t sview = 9001;
+    emit(VIRGL_CMD_HDR(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_SAMPLER_VIEW, 6));
+    emit(sview);
+    emit(tex_res_id);
+    emit(VIRGL_FORMAT_B8G8R8X8_UNORM);
+    emit(0);        /* val0: first_layer=0 | last_layer=0<<16 */
+    emit(0);        /* val1: first_level=0 | last_level=0<<8  */
+    emit(0x688);    /* swizzle: R,G,B,A */
+    if (!virgl_cmd_submit()) {
+        serial_printf("virgl_pipeline: sampler VIEW create REJECTED\n");
+        fs_tex_handle = 0;
+        return false;
+    }
+    serial_printf("virgl_pipeline: sampler view created (9001)\n");
+    virgl_cmd_begin();
+
+    /* Sampler state: CLAMP_TO_EDGE wrap, LINEAR min/mag, no mips.
+     * word0 bitfield: wrap_s[0:2]=2 wrap_t[3:5]=2 wrap_r[6:8]=2
+     *                 min_img[9:10]=1 min_mip[11:12]=2 mag_img[13]=1 */
+    uint32_t sstate = 9002;
+    emit(VIRGL_CMD_HDR(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_SAMPLER_STATE, 9));
+    emit(sstate);
+    emit(2u | (2u << 3) | (2u << 6) | (1u << 9) | (2u << 11) | (1u << 13));
+    emit(0);                 /* lod bias 0.0f */
+    emit(0);                 /* min lod 0.0f */
+    emit(0);                 /* max lod 0.0f */
+    emit(0); emit(0); emit(0); emit(0);   /* border color */
+    if (!virgl_cmd_submit()) {
+        serial_printf("virgl_pipeline: sampler STATE create REJECTED\n");
+        fs_tex_handle = 0;
+        return false;
+    }
+    serial_printf("virgl_pipeline: sampler state created (9002)\n");
+    virgl_cmd_begin();
+
+    /* Bind view + state to fragment slot 0 */
+    emit(VIRGL_CMD_HDR(VIRGL_CCMD_SET_SAMPLER_VIEWS, 0, 3));
+    emit(PIPE_SHADER_FRAGMENT);
+    emit(0);        /* start slot */
+    emit(sview);
+
+    emit(VIRGL_CMD_HDR(VIRGL_CCMD_BIND_SAMPLER_STATES, 0, 3));
+    emit(PIPE_SHADER_FRAGMENT);
+    emit(0);        /* start slot */
+    emit(sstate);
+
+    if (ctx->cmd_pos == 0) {
+        /* Nothing was emitted — never report a false "ready" */
+        serial_printf("virgl_pipeline: texturing setup emitted nothing!\n");
+        fs_tex_handle = 0;
+        return false;
+    }
+    if (!virgl_cmd_submit()) {
+        serial_printf("virgl_pipeline: texturing setup submit FAILED\n");
+        fs_tex_handle = 0;
+        return false;
+    }
+    serial_printf("virgl_pipeline: texturing ready (fs=%u view=%u state=%u)\n",
+                  fs_tex_handle, sview, sstate);
+    return true;
+}

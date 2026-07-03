@@ -133,11 +133,34 @@ static virgl_ctx_t vctx;
 
 /* Aligned command/response buffers for GPU commands */
 /* Was 4096 — must be larger than biggest command + SUBMIT_3D header */
-static uint8_t v3d_cmd_buf[131072]  __attribute__((aligned(4096)));
+static uint8_t v3d_cmd_buf[786432]  __attribute__((aligned(4096)));  /* fits full GPU scene batches */
 static uint8_t v3d_resp_buf[4096]   __attribute__((aligned(4096)));
 
 static uint32_t* vctx_display_backing = NULL; // Add this global
 static uint32_t* vctx_fb_backing = NULL; 
+
+/*
+ * GPU submit lock. The GUI task (compiz composites) and an app task (GL
+ * batches) both funnel through the shared staging buffers and virtqueue.
+ * Preemption mid-submit would interleave ring/staging writes, so serialize.
+ * Single CPU: cli() makes test-and-set atomic; holders never re-acquire.
+ */
+static volatile bool gpu_submit_lock = false;
+static void gpu_lock_acquire(void) {
+    for (;;) {
+        cli();
+        if (!gpu_submit_lock) {
+            gpu_submit_lock = true;
+            sti();
+            return;
+        }
+        sti();
+        task_yield();
+    }
+}
+static void gpu_lock_release(void) {
+    gpu_submit_lock = false;
+}
 
 
 
@@ -147,6 +170,7 @@ static uint32_t* vctx_fb_backing = NULL;
 
 /* ===== Low-level GPU command helper (same pattern as virtio_gpu.c) ===== */
 static bool gpu3d_cmd(void* cmd, uint32_t cmd_len, void* resp, uint32_t resp_len) {
+    gpu_lock_acquire();
     memcpy(v3d_cmd_buf, cmd, cmd_len);
     memset(v3d_resp_buf, 0, resp_len);
 
@@ -155,12 +179,14 @@ static bool gpu3d_cmd(void* cmd, uint32_t cmd_len, void* resp, uint32_t resp_len
                            (uint32_t)v3d_resp_buf, resp_len);
     if (head < 0) {
         //serial_printf("virgl: failed to submit gpu command\n");
+        gpu_lock_release();
         return false;
     }
 
     virtio_notify(virgl_dev, VIRTIO_GPU_QUEUE_CONTROL);
     virtio_wait(virgl_dev, VIRTIO_GPU_QUEUE_CONTROL);
     memcpy(resp, v3d_resp_buf, resp_len);
+    gpu_lock_release();
 
     virtio_gpu_ctrl_hdr_t* hdr = (virtio_gpu_ctrl_hdr_t*)resp;
     if (hdr->type >= VIRTIO_GPU_RESP_ERR_UNSPEC) {
@@ -187,7 +213,33 @@ static uint32_t alloc_res_id(void) {
    // }
 //}
 
+/* ================================================================
+ * Windowed GL apps (per-app virgl sub-contexts)
+ *
+ * With the compiz compositor active, a GL app no longer takes over the
+ * scanout. Instead it gets its own virgl SUB-CONTEXT (isolated GL state
+ * inside the one virtio-gpu context) and renders into its own texture,
+ * which is read back into guest RAM and composited by the GUI like any
+ * other window content.
+ * ================================================================ */
+static bool     app_windowed   = false;  /* app renders to texture, not scanout */
+static uint32_t app_sub_ctx    = 0;      /* sub-context id used by the app */
+static uint16_t app_fb_w = 0, app_fb_h = 0;
+static bool     setup_skip_display = false; /* setup_framebuffer: skip display/scanout */
+
 static inline void emit(uint32_t word) {
+    /*
+     * Auto-tag batches with the app's sub-context: whenever a new batch
+     * starts (cmd_pos == 0), prepend SET_SUB_CTX(app_sub_ctx) so all app
+     * GL state/draws land in the app's sub-context no matter which code
+     * path started the batch. The compiz compositor never uses emit()
+     * (it builds its batches in local buffers tagged SET_SUB_CTX 0).
+     */
+    if (app_windowed && vctx.cmd_pos == 0 && vctx.cmd_buf_size >= 8) {
+        vctx.cmd_buf[0] = VIRGL_CMD_HDR(VIRGL_CCMD_SET_SUB_CTX, 0, 1);
+        vctx.cmd_buf[1] = app_sub_ctx;
+        vctx.cmd_pos = 2;
+    }
     if (vctx.cmd_pos < (vctx.cmd_buf_size / 4)) {
         vctx.cmd_buf[vctx.cmd_pos++] = word;
     } else {
@@ -393,6 +445,8 @@ static bool virgl_submit_cmd_buf(uint32_t *cmds, uint32_t size_bytes)
         return false;
     }
 
+    gpu_lock_acquire();
+
     virtio_gpu_cmd_submit_3d_t *s = (virtio_gpu_cmd_submit_3d_t *)v3d_cmd_buf;
     const uint32_t total_bytes = (uint32_t)sizeof(*s) + size_bytes;
 
@@ -400,6 +454,7 @@ static bool virgl_submit_cmd_buf(uint32_t *cmds, uint32_t size_bytes)
     if (total_bytes > (uint32_t)sizeof(v3d_cmd_buf)) {
         //serial_printf("virgl: submit_3d overflow total=%u (hdr=%u + payload=%u) buf=%u\n",
                   //    total_bytes, (uint32_t)sizeof(*s), size_bytes, (uint32_t)sizeof(v3d_cmd_buf));
+        gpu_lock_release();
         return false;
     }
 
@@ -424,6 +479,7 @@ static bool virgl_submit_cmd_buf(uint32_t *cmds, uint32_t size_bytes)
     if (head < 0) {
         //serial_printf("virgl: virtio_send submit_3d failed head=%d total_bytes=%u\n",
                //       head, total_bytes);
+        gpu_lock_release();
         return false;
     }
 
@@ -434,9 +490,11 @@ static bool virgl_submit_cmd_buf(uint32_t *cmds, uint32_t size_bytes)
     if (resp->type >= VIRTIO_GPU_RESP_ERR_UNSPEC) {
         //serial_printf("virgl: submit_3d failed resp.type=%x ctx=%u size_bytes=%u total=%u\n",
                   //    resp->type, vctx.ctx_id, size_bytes, total_bytes);
+        gpu_lock_release();
         return false;
     }
 
+    gpu_lock_release();
     return true;
 }
 
@@ -969,7 +1027,7 @@ if (!virgl_create_resource_3d(vctx.depth_res_id,
     /* ------------------------------------------------------------
      * 3) VBO (PIPE_BUFFER)
      * ------------------------------------------------------------ */
-    vctx.vbo_size   = 256 * 1024;
+    vctx.vbo_size   = 1024 * 1024;  /* holds the GPU desktop scene (512KB verts) */
     vctx.vbo_res_id = alloc_res_id();
     //serial_printf("virgl: creating VBO resource %u\n", vctx.vbo_res_id);
 
@@ -1001,7 +1059,15 @@ if (!virgl_create_resource_3d(vctx.depth_res_id,
 
     /* ------------------------------------------------------------
      * 4) DISPLAY (3D texture used as scanout resource)
+     * Skipped for windowed apps: the compiz compositor already owns
+     * the display resource and scanout — the app renders only to its
+     * own fb texture, which is read back and composited as a window.
      * ------------------------------------------------------------ */
+    if (setup_skip_display) {
+        //serial_printf("virgl: windowed setup — skipping display/scanout\n");
+        return true;
+    }
+
     vctx.display_res_id = alloc_res_id();
     //serial_printf("virgl: creating 3D display resource %u for scanout\n", vctx.display_res_id);
 
@@ -1238,13 +1304,58 @@ void virgl_cmd_set_constant_buffer(uint32_t shader_type,
 
 
 
+/* Perf instrumentation: cycles spent inside submit vs flush, read and
+ * reset by the FPS reporter in syscall.c */
+uint64_t virgl_stat_submit_tsc = 0;
+uint64_t virgl_stat_flush_tsc  = 0;
+
 void virgl_present(void)
 {
-    /* Ensure all 3D rendering is finished */
-    (void)virgl_cmd_submit();
+    uint64_t t0 = rdtsc();
 
-    /* 1) Copy color buffer -> display resource (host-side copy) */
-    virgl_cmd_begin();
+    if (app_windowed) {
+        /*
+         * Windowed present: submit the frame batch (auto-tagged with the
+         * app's sub-context by emit()), then read the rendered color
+         * buffer back into its guest backing. The GUI composites those
+         * pixels into the app's desktop window like any other content —
+         * Z-order, dragging, and the cursor stay correct for free.
+         */
+        if (!virgl_cmd_submit()) return;
+
+        uint64_t t1 = rdtsc();
+        virgl_stat_submit_tsc += t1 - t0;
+
+        virtio_gpu_transfer_host_3d_t xfer;
+        memset(&xfer, 0, sizeof(xfer));
+        xfer.hdr.type   = VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D;
+        xfer.hdr.ctx_id = vctx.ctx_id;
+        xfer.box.x = 0;
+        xfer.box.y = 0;
+        xfer.box.z = 0;
+        xfer.box.w = app_fb_w;
+        xfer.box.h = app_fb_h;
+        xfer.box.d = 1;
+        xfer.offset       = 0;
+        xfer.resource_id  = vctx.fb_res_id;
+        xfer.level        = 0;
+        xfer.stride       = (uint32_t)app_fb_w * 4;
+        xfer.layer_stride = 0;
+        if (!gpu3d_cmd_ok(&xfer, sizeof(xfer))) {
+            serial_printf("virgl: windowed readback failed\n");
+        }
+
+        virgl_stat_flush_tsc += rdtsc() - t1;
+        return;
+    }
+    /*
+     * Emit the color-buffer -> display-resource copy INTO the pending
+     * frame batch (clear + vertex upload + draw are still unsubmitted),
+     * then submit everything in ONE SUBMIT_3D round-trip. Previously
+     * this was two round-trips: submit(frame), then submit(copy).
+     * Each round-trip that misses the spin window costs a 10ms tick,
+     * so halving them matters.
+     */
     emit(VIRGL_CMD_HDR(VIRGL_CCMD_RESOURCE_COPY_REGION, 0, 13));
     emit(vctx.display_res_id); /* dst */
     emit(0); emit(0); emit(0); emit(0);
@@ -1255,9 +1366,12 @@ void virgl_present(void)
     emit(1);
 
     if (!virgl_cmd_submit()) {
-        //serial_printf("virgl_present: COPY_REGION failed\n");
+        //serial_printf("virgl_present: submit failed\n");
         return;
     }
+
+    uint64_t t1 = rdtsc();
+    virgl_stat_submit_tsc += t1 - t0;
 
     /* 2) Flush scanout so QEMU updates the display */
     virtio_gpu_resource_flush_t flush;
@@ -1273,6 +1387,8 @@ void virgl_present(void)
     if (!gpu3d_cmd_ok(&flush, sizeof(flush))) {
         //serial_printf("virgl_present: RESOURCE_FLUSH failed\n");
     }
+
+    virgl_stat_flush_tsc += rdtsc() - t1;
 }
 
 
@@ -1297,6 +1413,661 @@ void virgl_shutdown(void) {
 // Add this getter function:
 uint32_t* virgl_get_display_backing(void) {
     return vctx_display_backing;
+}
+
+/* True while a virgl 3D context owns scanout 0 (i.e. a GL app is on screen).
+ * The 2D GUI compositor uses this to stop repainting the invisible desktop. */
+bool virgl_scanout_active(void) {
+    return vctx.initialized;
+}
+
+/* ================================================================
+ *  "compiz" mode — GPU-composited desktop
+ *
+ *  Pipeline per frame:
+ *    1. GUI renders the desktop into the guest backing buffer (CPU,
+ *       pixel-identical to the classic path).
+ *    2. TRANSFER_TO_HOST_3D DMAs only the dirty row band into a virgl
+ *       GPU texture (compiz_tex).
+ *    3. A batched RESOURCE_COPY_REGION composites the band from the
+ *       texture to the display resource — executed by virglrenderer
+ *       as a GL operation on the host GPU.
+ *    4. RESOURCE_FLUSH updates the visible scanout.
+ *
+ *  Everything below reuses command paths already proven by hello.elf
+ *  (resource_create_3d, attach_backing, ctx_attach, copy_region, flush).
+ * ================================================================ */
+
+static uint32_t compiz_tex_id = 0;
+static uint16_t compiz_w = 0, compiz_h = 0;
+
+/* Orientation: QEMU with gl=on typically displays GL-written scanout
+ * resources bottom-up, so the DEFAULT is flip=true: chrome is drawn
+ * GL-upright and CPU content is uploaded row-mirrored, both landing
+ * upright on a flipped scanout. If a host/driver combo shows it the
+ * other way, the backtick (`) key toggles this live. */
+static bool compiz_flip = true;
+
+/* Texturing (wobbly windows) is opt-in: every automatic attempt so far
+ * has context-errored some hosts to a black screen. Plain `compiz` runs
+ * the proven pipeline only; `compiz wobble` arms this. */
+static bool compiz_want_texturing = false;
+void virgl_compiz_enable_texturing(bool on) { compiz_want_texturing = on; }
+
+/* Dedicated staging buffer backing the desktop texture (row-mirroring
+ * happens on copy-in, so it can't be the GUI backbuffer itself). */
+static uint32_t* compiz_stage = NULL;
+
+/* Saved at compiz init: the compositor's own resources, so a windowed
+ * app re-running virgl_setup_framebuffer can't steal them from us. */
+static uint32_t compiz_fb_res   = 0;
+static uint32_t compiz_vbo_res  = 0;
+static uint32_t compiz_vbo_size = 0;
+
+bool virgl_compiz_active(void) {
+    return compiz_tex_id != 0;
+}
+
+void virgl_compiz_set_flip(bool f) { compiz_flip = f; }
+bool virgl_compiz_get_flip(void)   { return compiz_flip; }
+
+bool virgl_compiz_init(uint16_t w, uint16_t h, void* backing) {
+    if (!backing) return false;
+
+    if (!virgl_init()) {
+        serial_printf("compiz: virgl_init failed\n");
+        return false;
+    }
+    /* Creates fb/depth/vbo/display resources at desktop resolution and
+     * issues SET_SCANOUT(display_res) — same proven path hello.elf uses. */
+    if (!virgl_setup_framebuffer(w, h)) {
+        serial_printf("compiz: framebuffer setup failed\n");
+        return false;
+    }
+
+    /* Desktop texture: a host GPU texture whose backing store is the GUI's
+     * render buffer, so dirty bands can be DMA'd straight from it. */
+    compiz_tex_id = alloc_res_id();
+    if (!virgl_create_resource_3d(compiz_tex_id,
+                                  PIPE_TEXTURE_2D,
+                                  VIRGL_FORMAT_B8G8R8X8_UNORM,
+                                  VIRGL_BIND_SAMPLER_VIEW | VIRGL_BIND_RENDER_TARGET,
+                                  w, h, 1)) {
+        serial_printf("compiz: desktop texture create failed\n");
+        compiz_tex_id = 0;
+        return false;
+    }
+
+    (void)backing;  /* content now arrives via the internal staging buffer */
+    compiz_stage = (uint32_t*)kmalloc((uint32_t)w * h * 4 + PAGE_SIZE);
+    if (!compiz_stage) {
+        serial_printf("compiz: staging alloc failed\n");
+        compiz_tex_id = 0;
+        return false;
+    }
+    compiz_stage = (uint32_t*)(((uint32_t)compiz_stage + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1));
+    memset(compiz_stage, 0, (uint32_t)w * h * 4);
+
+    uint32_t backing_phys = virt_to_phys(compiz_stage);
+    if (!virgl_attach_backing(compiz_tex_id, backing_phys, (uint32_t)w * h * 4)) {
+        serial_printf("compiz: attach backing failed\n");
+        compiz_tex_id = 0;
+        return false;
+    }
+    if (!virgl_ctx_attach(compiz_tex_id)) {
+        serial_printf("compiz: ctx attach failed\n");
+        compiz_tex_id = 0;
+        return false;
+    }
+
+    compiz_w = w;
+    compiz_h = h;
+
+    /* The compositor renders the desktop chrome as GPU geometry, so it
+     * needs full pipe state (shaders, DSA, vertex elements, framebuffer
+     * binding, viewport) in sub-context 0. This runs before any windowed
+     * app exists, so all batches land in sub-ctx 0 untagged. */
+    if (!virgl_setup_pipeline_state()) {
+        serial_printf("compiz: pipeline setup failed — GPU scene disabled\n");
+        compiz_fb_res = 0;
+    } else {
+        virgl_cmd_set_viewport(w, h);
+        virgl_cmd_submit();
+        /* Capture our resource ids NOW: a windowed app re-running
+         * virgl_setup_framebuffer later overwrites the vctx fields. */
+        compiz_fb_res   = vctx.fb_res_id;
+        compiz_vbo_res  = vctx.vbo_res_id;
+        compiz_vbo_size = vctx.vbo_size;
+        serial_printf("compiz: GPU scene pipeline ready (fb=%u vbo=%u)\n",
+                      compiz_fb_res, compiz_vbo_res);
+        /* Texture sampling for wobbly windows (desktop tex as SAMP[0]).
+         * OPT-IN via `compiz wobble` — a rejected packet can poison the
+         * whole virgl context (black screen), so plain compiz never
+         * risks it. */
+        if (compiz_want_texturing) {
+            extern bool virgl_pipeline_setup_texturing(uint32_t tex_res_id);
+            if (!virgl_pipeline_setup_texturing(compiz_tex_id))
+                serial_printf("compiz: texturing unavailable — wobble disabled\n");
+        } else {
+            serial_printf("compiz: wobble not armed (use 'compiz wobble')\n");
+        }
+    }
+
+    serial_printf("compiz: GPU compositor up — %ux%u, tex=%u display=%u\n",
+                  w, h, compiz_tex_id, vctx.display_res_id);
+    return true;
+}
+
+void virgl_compiz_present(uint32_t y0, uint32_t band_h) {
+    if (!compiz_tex_id || !vctx.initialized) return;
+    if (y0 >= compiz_h) return;
+    if (y0 + band_h > compiz_h) band_h = compiz_h - y0;
+    if (band_h == 0) return;
+
+    const uint32_t stride = (uint32_t)compiz_w * 4;
+
+    /* 1) DMA the dirty band: guest backing -> host texture */
+    virtio_gpu_transfer_host_3d_t xfer;
+    memset(&xfer, 0, sizeof(xfer));
+    xfer.hdr.type   = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D;
+    xfer.hdr.ctx_id = vctx.ctx_id;
+    xfer.box.x = 0;
+    xfer.box.y = y0;
+    xfer.box.z = 0;
+    xfer.box.w = compiz_w;
+    xfer.box.h = band_h;
+    xfer.box.d = 1;
+    xfer.offset       = (uint64_t)y0 * stride;
+    xfer.resource_id  = compiz_tex_id;
+    xfer.level        = 0;
+    xfer.stride       = stride;
+    xfer.layer_stride = 0;
+    if (!gpu3d_cmd_ok(&xfer, sizeof(xfer))) {
+        serial_printf("compiz: transfer_to_host_3d failed (y=%u h=%u)\n", y0, band_h);
+        return;
+    }
+
+    /* 2) GPU-side composite: texture band -> display resource.
+     * Built in a LOCAL buffer, not the shared vctx.cmd_buf: a GL app may
+     * have a half-built batch in there across syscalls. Tagged with
+     * SET_SUB_CTX 0 so the copy always runs in the compositor's
+     * sub-context regardless of what the app selected last. */
+    {
+        uint32_t cbuf[16];
+        int n = 0;
+        cbuf[n++] = VIRGL_CMD_HDR(VIRGL_CCMD_SET_SUB_CTX, 0, 1);
+        cbuf[n++] = 0;                     /* sub-context 0 = compositor */
+        cbuf[n++] = VIRGL_CMD_HDR(VIRGL_CCMD_RESOURCE_COPY_REGION, 0, 13);
+        cbuf[n++] = vctx.display_res_id;   /* dst handle */
+        cbuf[n++] = 0;                     /* dst level */
+        cbuf[n++] = 0;                     /* dst x */
+        cbuf[n++] = y0;                    /* dst y */
+        cbuf[n++] = 0;                     /* dst z */
+        cbuf[n++] = compiz_tex_id;         /* src handle */
+        cbuf[n++] = 0;                     /* src level */
+        cbuf[n++] = 0;                     /* src x */
+        cbuf[n++] = y0;                    /* src y */
+        cbuf[n++] = 0;                     /* src z */
+        cbuf[n++] = compiz_w;              /* width  */
+        cbuf[n++] = band_h;                /* height */
+        cbuf[n++] = 1;                     /* depth  */
+        if (!virgl_submit_cmd_buf(cbuf, (uint32_t)n * 4)) {
+            serial_printf("compiz: composite submit failed\n");
+            return;
+        }
+    }
+
+    /* 3) Flush the band to the visible scanout */
+    virtio_gpu_resource_flush_t flush;
+    memset(&flush, 0, sizeof(flush));
+    flush.hdr.type    = VIRTIO_GPU_CMD_RESOURCE_FLUSH;
+    flush.resource_id = vctx.display_res_id;
+    flush.r.x = 0;
+    flush.r.y = y0;
+    flush.r.width  = compiz_w;
+    flush.r.height = band_h;
+    gpu3d_cmd_ok(&flush, sizeof(flush));
+}
+
+void virgl_compiz_shutdown(void) {
+    if (compiz_tex_id) {
+        /* Detach + unref the desktop texture so the id can be reused */
+        virtio_gpu_resource_detach_backing_t detach;
+        memset(&detach, 0, sizeof(detach));
+        detach.hdr.type    = VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING;
+        detach.resource_id = compiz_tex_id;
+        gpu3d_cmd_ok(&detach, sizeof(detach));
+
+        virtio_gpu_resource_unref_t unref;
+        memset(&unref, 0, sizeof(unref));
+        unref.hdr.type    = VIRTIO_GPU_CMD_RESOURCE_UNREF;
+        unref.resource_id = compiz_tex_id;
+        gpu3d_cmd_ok(&unref, sizeof(unref));
+
+        compiz_tex_id = 0;
+    }
+    compiz_w = compiz_h = 0;
+    virgl_shutdown();
+}
+
+/* ================================================================
+ *  Windowed GL app lifecycle (sub-context per app)
+ * ================================================================ */
+
+static bool virgl_sub_ctx_cmd(uint32_t ccmd, uint32_t id) {
+    uint32_t buf[2];
+    buf[0] = VIRGL_CMD_HDR(ccmd, 0, 1);
+    buf[1] = id;
+    return virgl_submit_cmd_buf(buf, sizeof(buf));
+}
+
+bool virgl_app_windowed_active(void) {
+    return app_windowed;
+}
+
+/* Begin windowed app setup: create + select the app's sub-context and
+ * switch resource setup into "no display/scanout" mode. The caller then
+ * runs virgl_setup_framebuffer + virgl_setup_pipeline_state as usual —
+ * emit() auto-prefixes every batch with SET_SUB_CTX(app), so all pipe
+ * state lands in the app's sub-context, isolated from the compositor. */
+bool virgl_app_windowed_begin(uint16_t w, uint16_t h) {
+    if (!vctx.initialized || !virgl_compiz_active()) return false;
+    if (app_windowed) return false;   /* one windowed app at a time (v1) */
+
+    if (!virgl_sub_ctx_cmd(VIRGL_CCMD_CREATE_SUB_CTX, 1)) {
+        serial_printf("virgl: CREATE_SUB_CTX failed\n");
+        return false;
+    }
+    app_sub_ctx  = 1;
+    app_windowed = true;
+    setup_skip_display = true;
+    app_fb_w = w;
+    app_fb_h = h;
+    serial_printf("virgl: windowed app sub-context %u created (%ux%u)\n",
+                  app_sub_ctx, w, h);
+    return true;
+}
+
+/* Called after framebuffer+pipeline setup succeeded (or to abort). */
+void virgl_app_windowed_commit(bool ok) {
+    setup_skip_display = false;
+    if (!ok) {
+        virgl_sub_ctx_cmd(VIRGL_CCMD_DESTROY_SUB_CTX, app_sub_ctx);
+        app_windowed = false;
+        app_sub_ctx  = 0;
+        app_fb_w = app_fb_h = 0;
+    }
+}
+
+/* GUI accessor: the app's rendered pixels (guest backing of its color
+ * buffer, filled by the readback in virgl_present). */
+uint32_t* virgl_app_backing(uint16_t* w, uint16_t* h) {
+    if (!app_windowed || !vctx_fb_backing) return NULL;
+    if (w) *w = app_fb_w;
+    if (h) *h = app_fb_h;
+    return vctx_fb_backing;
+}
+
+void virgl_app_windowed_end(void) {
+    if (!app_windowed) return;
+    /* Drop any half-built batch the (possibly killed) app left behind,
+     * so the next batch starts clean at cmd_pos 0. */
+    vctx.cmd_pos = 0;
+    virgl_sub_ctx_cmd(VIRGL_CCMD_DESTROY_SUB_CTX, app_sub_ctx);
+    app_windowed = false;
+    app_sub_ctx  = 0;
+    app_fb_w = app_fb_h = 0;
+    serial_printf("virgl: windowed app sub-context destroyed\n");
+    /* App fb/depth/vbo resources are leaked host-side until virgl teardown
+     * — acceptable for v1 (ids keep incrementing, no collisions). */
+}
+
+/* Exposed so the GUI can quiesce the GPU pipe before killing a GL app:
+ * acquiring the lock waits for any in-flight submit by the app to finish,
+ * ensuring the app never dies while holding the lock (which would
+ * deadlock the compositor forever). */
+void virgl_lock_gpu(void)   { gpu_lock_acquire(); }
+void virgl_unlock_gpu(void) { gpu_lock_release(); }
+
+/* ================================================================
+ *  GPU SCENE RENDERER — the desktop drawn BY the GPU
+ *
+ *  The desktop chrome (background gradient, window frames, titlebars,
+ *  title text, taskbar, start button, cursor) is submitted as real
+ *  triangle geometry each frame and rendered by the host GPU through
+ *  virglrenderer. Text-heavy/dynamic content (window client areas,
+ *  taskbar strip, start menu) stays CPU-rendered and is composited on
+ *  top from the desktop texture as opaque rectangles.
+ *
+ *  The whole scene batch lives in its own static buffer — never the
+ *  shared vctx.cmd_buf, which may hold a GL app's half-built batch —
+ *  and is tagged SET_SUB_CTX 0 so it uses the compositor's pipe state
+ *  (shaders/framebuffer/DSA bound at compiz init), isolated from any
+ *  windowed app's sub-context state.
+ *
+ *  Depth func is LESS with clear-depth 1.0, so painter's order is
+ *  enforced by strictly decreasing z per primitive.
+ * ================================================================ */
+
+#define SCENE_MAX_VERTS 16384                 /* x 32 bytes = 512 KB */
+static float    scene_verts[SCENE_MAX_VERTS * 8];
+static uint32_t scene_nverts = 0;
+#define SCENE_MAX_TEX_VERTS 4096              /* x 32B = 128 KB */
+static float    scene_tex_verts[SCENE_MAX_TEX_VERTS * 8];
+static uint32_t scene_tex_nverts = 0;
+static float    scene_z = 0.999f;
+static uint32_t scene_cmd[176000];            /* ~688 KB batch build buffer */
+
+void virgl_scene_begin(void) {
+    scene_nverts = 0;
+    scene_tex_nverts = 0;
+    scene_z = 0.999f;
+}
+
+static void scene_vtx(float px, float py, uint32_t rgb) {
+    if (scene_nverts >= SCENE_MAX_VERTS) return;
+    float* v = &scene_verts[scene_nverts * 8];
+    v[0] = -1.0f + 2.0f * px / (float)compiz_w;
+    /* Orientation-aware. The pipeline's negative-viewport hack already
+     * flips GL output top-down in the texture, so on a flipped scanout
+     * (flip=true) chrome must be drawn with screen-top -> NDC -1 to land
+     * row-mirrored in the texture like the CPU content does. (Confirmed
+     * empirically: the +1 mapping put the GPU taskbar at the screen top
+     * and titlebars at window bottoms.) Toggled live with `. */
+    v[1] = compiz_flip ? (-1.0f + 2.0f * py / (float)compiz_h)
+                       : ( 1.0f - 2.0f * py / (float)compiz_h);
+    v[2] = scene_z;
+    v[3] = 1.0f;
+    v[4] = (float)((rgb >> 16) & 0xFF) / 255.0f;
+    v[5] = (float)((rgb >>  8) & 0xFF) / 255.0f;
+    v[6] = (float)( rgb        & 0xFF) / 255.0f;
+    v[7] = 1.0f;
+    scene_nverts++;
+}
+
+static void scene_step_z(void) {
+    scene_z -= 0.00006f;
+    if (scene_z < 0.001f) scene_z = 0.001f;
+}
+
+/* Quad with per-corner colors (GPU interpolates the gradient) */
+void virgl_scene_quad4(int x, int y, int w, int h,
+                       uint32_t c00, uint32_t c10, uint32_t c11, uint32_t c01) {
+    if (w <= 0 || h <= 0) return;
+    scene_vtx((float)x,     (float)y,     c00);
+    scene_vtx((float)(x+w), (float)y,     c10);
+    scene_vtx((float)(x+w), (float)(y+h), c11);
+    scene_vtx((float)x,     (float)y,     c00);
+    scene_vtx((float)(x+w), (float)(y+h), c11);
+    scene_vtx((float)x,     (float)(y+h), c01);
+    scene_step_z();
+}
+
+void virgl_scene_quad(int x, int y, int w, int h, uint32_t c) {
+    virgl_scene_quad4(x, y, w, h, c, c, c, c);
+}
+
+void virgl_scene_tri(int x0, int y0, int x1, int y1, int x2, int y2, uint32_t c) {
+    scene_vtx((float)x0, (float)y0, c);
+    scene_vtx((float)x1, (float)y1, c);
+    scene_vtx((float)x2, (float)y2, c);
+    scene_step_z();
+}
+
+uint32_t virgl_scene_free_verts(void) {
+    return SCENE_MAX_VERTS - scene_nverts;
+}
+
+/* ---- textured triangles (wobbly windows) ----
+ * UVs ride in the color attribute (.xy) and the texturing fragment
+ * shader samples the desktop texture with them. Coordinates are given
+ * in DESKTOP PIXELS (both position and texel), and the same
+ * orientation convention as the plain scene applies automatically. */
+
+static void scene_tex_vtx(float px, float py, float tx, float ty) {
+    if (scene_tex_nverts >= SCENE_MAX_TEX_VERTS) return;
+    float* v = &scene_tex_verts[scene_tex_nverts * 8];
+    v[0] = -1.0f + 2.0f * px / (float)compiz_w;
+    v[1] = compiz_flip ? (-1.0f + 2.0f * py / (float)compiz_h)
+                       : ( 1.0f - 2.0f * py / (float)compiz_h);
+    v[2] = scene_z;
+    v[3] = 1.0f;
+    /* Texture rows are stored mirrored under flip — mirror V to match */
+    v[4] = tx / (float)compiz_w;
+    v[5] = compiz_flip ? (((float)compiz_h - ty) / (float)compiz_h)
+                       : (ty / (float)compiz_h);
+    v[6] = 0.0f;
+    v[7] = 1.0f;
+    scene_tex_nverts++;
+}
+
+void virgl_scene_tex_tri(float px0, float py0, float tx0, float ty0,
+                         float px1, float py1, float tx1, float ty1,
+                         float px2, float py2, float tx2, float ty2) {
+    scene_tex_vtx(px0, py0, tx0, ty0);
+    scene_tex_vtx(px1, py1, tx1, ty1);
+    scene_tex_vtx(px2, py2, tx2, ty2);
+    scene_step_z();
+}
+
+bool virgl_scene_available(void) {
+    return vctx.initialized && compiz_fb_res != 0;
+}
+
+/* Render the accumulated scene into the compositor framebuffer:
+ * one batch = SET_SUB_CTX 0, CLEAR, vertex INLINE_WRITE into the
+ * compositor VBO, SET_VERTEX_BUFFERS, DRAW_VBO. One round trip. */
+bool virgl_scene_flush(void) {
+    if (!vctx.initialized || !compiz_fb_res) return false;
+
+    extern uint32_t virgl_pipeline_fs_plain(void);
+    extern uint32_t virgl_pipeline_fs_tex(void);
+
+    uint32_t vbytes = scene_nverts * 8 * 4;
+    uint32_t tbytes = scene_tex_nverts * 8 * 4;
+    if (vbytes + tbytes > compiz_vbo_size) {
+        if (vbytes > compiz_vbo_size) vbytes = compiz_vbo_size;
+        tbytes = compiz_vbo_size - vbytes;
+    }
+    uint32_t nverts  = vbytes / 32;
+    uint32_t ntverts = (virgl_pipeline_fs_tex() != 0) ? (tbytes / 32) : 0;
+    if (nverts == 0 && ntverts == 0) return true;
+
+    uint32_t n = 0;
+    scene_cmd[n++] = VIRGL_CMD_HDR(VIRGL_CCMD_SET_SUB_CTX, 0, 1);
+    scene_cmd[n++] = 0;
+
+    /* CLEAR color+depth (same encoding as virgl_cmd_clear) */
+    scene_cmd[n++] = VIRGL_CMD_HDR(VIRGL_CCMD_CLEAR, 0, 8);
+    scene_cmd[n++] = 4u | 1u;         /* PIPE_CLEAR_COLOR0 | PIPE_CLEAR_DEPTH */
+    scene_cmd[n++] = 0;               /* r = 0.0f */
+    scene_cmd[n++] = 0;               /* g */
+    scene_cmd[n++] = 0;               /* b */
+    scene_cmd[n++] = f2u(1.0f);       /* a */
+    {
+        uint64_t dz = d2u(1.0);
+        scene_cmd[n++] = (uint32_t)(dz & 0xFFFFFFFFu);
+        scene_cmd[n++] = (uint32_t)(dz >> 32);
+    }
+    scene_cmd[n++] = 0;               /* stencil */
+
+    /* Vertex data -> compositor VBO (RESOURCE_INLINE_WRITE):
+     * plain scene verts followed by textured (wobble) verts */
+    uint32_t total_bytes = vbytes + ntverts * 32;
+    uint32_t data_words = total_bytes / 4;
+    scene_cmd[n++] = VIRGL_CMD_HDR(VIRGL_CCMD_RESOURCE_INLINE_WRITE, 0, 11 + data_words);
+    scene_cmd[n++] = compiz_vbo_res;
+    scene_cmd[n++] = 0;               /* level */
+    scene_cmd[n++] = 0;               /* usage */
+    scene_cmd[n++] = 0;               /* stride */
+    scene_cmd[n++] = 0;               /* layer_stride */
+    scene_cmd[n++] = 0;               /* x */
+    scene_cmd[n++] = 0;               /* y */
+    scene_cmd[n++] = 0;               /* z */
+    scene_cmd[n++] = total_bytes;     /* w = bytes for buffers */
+    scene_cmd[n++] = 1;               /* h */
+    scene_cmd[n++] = 1;               /* d */
+    memcpy(&scene_cmd[n], scene_verts, vbytes);
+    if (ntverts)
+        memcpy((uint8_t*)&scene_cmd[n] + vbytes, scene_tex_verts, ntverts * 32);
+    n += data_words;
+
+    /* Bind vertex buffer (stride 32, offset 0) */
+    scene_cmd[n++] = VIRGL_CMD_HDR(VIRGL_CCMD_SET_VERTEX_BUFFERS, 0, 3);
+    scene_cmd[n++] = 32;
+    scene_cmd[n++] = 0;
+    scene_cmd[n++] = compiz_vbo_res;
+
+    /* DRAW_VBO (same 12-word layout as virgl_cmd_draw) */
+    scene_cmd[n++] = VIRGL_CMD_HDR(VIRGL_CCMD_DRAW_VBO, 0, 12);
+    scene_cmd[n++] = 0;                    /* start */
+    scene_cmd[n++] = nverts;               /* count */
+    scene_cmd[n++] = PIPE_PRIM_TRIANGLES;  /* mode */
+    scene_cmd[n++] = 0;                    /* indexed */
+    scene_cmd[n++] = 1;                    /* instance_count */
+    scene_cmd[n++] = 0;                    /* index_bias */
+    scene_cmd[n++] = 0;                    /* start_instance */
+    scene_cmd[n++] = 0;                    /* primitive_restart */
+    scene_cmd[n++] = 0;                    /* restart_index */
+    scene_cmd[n++] = 0;                    /* min_index */
+    scene_cmd[n++] = 0xFFFFFFFF;           /* max_index */
+    scene_cmd[n++] = 0;                    /* cso */
+
+    /* Wobbly-window pass: same VBO, texturing fragment shader, verts
+     * appended after the plain scene's — drawn with start=nverts. */
+    if (ntverts) {
+        scene_cmd[n++] = VIRGL_CMD_HDR(VIRGL_CCMD_BIND_SHADER, 0, 2);
+        scene_cmd[n++] = virgl_pipeline_fs_tex();
+        scene_cmd[n++] = PIPE_SHADER_FRAGMENT;
+
+        scene_cmd[n++] = VIRGL_CMD_HDR(VIRGL_CCMD_DRAW_VBO, 0, 12);
+        scene_cmd[n++] = nverts;               /* start */
+        scene_cmd[n++] = ntverts;              /* count */
+        scene_cmd[n++] = PIPE_PRIM_TRIANGLES;
+        scene_cmd[n++] = 0;
+        scene_cmd[n++] = 1;
+        scene_cmd[n++] = 0;
+        scene_cmd[n++] = 0;
+        scene_cmd[n++] = 0;
+        scene_cmd[n++] = 0;
+        scene_cmd[n++] = 0;
+        scene_cmd[n++] = 0xFFFFFFFF;
+        scene_cmd[n++] = 0;
+
+        scene_cmd[n++] = VIRGL_CMD_HDR(VIRGL_CCMD_BIND_SHADER, 0, 2);
+        scene_cmd[n++] = virgl_pipeline_fs_plain();
+        scene_cmd[n++] = PIPE_SHADER_FRAGMENT;
+    }
+
+    return virgl_submit_cmd_buf(scene_cmd, n * 4);
+}
+
+/* Composite pass: GPU-rendered chrome (compositor fb) -> display, then the
+ * CPU content rectangles (desktop texture) on top, then flush scanout. */
+void virgl_compiz_compose(const virgl_rect_t* rects, uint32_t nrects) {
+    if (!vctx.initialized || !compiz_fb_res) return;
+
+    uint32_t cbuf[2 + 15 * 80];
+    uint32_t n = 0;
+    cbuf[n++] = VIRGL_CMD_HDR(VIRGL_CCMD_SET_SUB_CTX, 0, 1);
+    cbuf[n++] = 0;
+
+    /* 1) chrome: compositor fb -> display (full screen) */
+    cbuf[n++] = VIRGL_CMD_HDR(VIRGL_CCMD_RESOURCE_COPY_REGION, 0, 13);
+    cbuf[n++] = vctx.display_res_id;
+    cbuf[n++] = 0; cbuf[n++] = 0; cbuf[n++] = 0; cbuf[n++] = 0;
+    cbuf[n++] = compiz_fb_res;
+    cbuf[n++] = 0; cbuf[n++] = 0; cbuf[n++] = 0; cbuf[n++] = 0;
+    cbuf[n++] = compiz_w;
+    cbuf[n++] = compiz_h;
+    cbuf[n++] = 1;
+
+    /* 2) stacked rects: CPU content (desktop texture) or GPU chrome (fb),
+     * in caller-supplied bottom-to-top order so window stacking is right.
+     * Screen-space rects are given by the GUI; when flip is on, every
+     * source AND destination lives in mirrored rows, so mirror uniformly. */
+    if (nrects > 78) nrects = 78;
+    for (uint32_t i = 0; i < nrects; i++) {
+        int x = rects[i].x, y = rects[i].y, w = rects[i].w, h = rects[i].h;
+        if (x < 0) { w += x; x = 0; }
+        if (y < 0) { h += y; y = 0; }
+        if (x + w > (int)compiz_w) w = (int)compiz_w - x;
+        if (y + h > (int)compiz_h) h = (int)compiz_h - y;
+        if (w <= 0 || h <= 0) continue;
+        uint32_t ry = compiz_flip ? (uint32_t)((int)compiz_h - y - h)
+                                  : (uint32_t)y;
+        cbuf[n++] = VIRGL_CMD_HDR(VIRGL_CCMD_RESOURCE_COPY_REGION, 0, 13);
+        cbuf[n++] = vctx.display_res_id;
+        cbuf[n++] = 0;
+        cbuf[n++] = (uint32_t)x; cbuf[n++] = ry; cbuf[n++] = 0;
+        cbuf[n++] = rects[i].src ? compiz_fb_res : compiz_tex_id;
+        cbuf[n++] = 0;
+        cbuf[n++] = (uint32_t)x; cbuf[n++] = ry; cbuf[n++] = 0;
+        cbuf[n++] = (uint32_t)w;
+        cbuf[n++] = (uint32_t)h;
+        cbuf[n++] = 1;
+    }
+
+    if (!virgl_submit_cmd_buf(cbuf, n * 4)) {
+        serial_printf("compiz: compose submit failed\n");
+        return;
+    }
+
+    /* 3) flush scanout (full screen) */
+    virtio_gpu_resource_flush_t flush;
+    memset(&flush, 0, sizeof(flush));
+    flush.hdr.type    = VIRTIO_GPU_CMD_RESOURCE_FLUSH;
+    flush.resource_id = vctx.display_res_id;
+    flush.r.x = 0;
+    flush.r.y = 0;
+    flush.r.width  = compiz_w;
+    flush.r.height = compiz_h;
+    gpu3d_cmd_ok(&flush, sizeof(flush));
+}
+
+/* Upload a dirty band of the CPU desktop into the desktop texture without
+ * presenting (the compose pass presents). Rows are copied from `src` into
+ * the staging buffer — mirrored vertically when flip is on, so content
+ * lands upright on a flipped scanout. */
+void virgl_compiz_upload_band(const uint32_t* src, uint32_t y0, uint32_t band_h) {
+    if (!compiz_tex_id || !vctx.initialized || !compiz_stage || !src) return;
+    if (y0 >= compiz_h) return;
+    if (y0 + band_h > compiz_h) band_h = compiz_h - y0;
+    if (band_h == 0) return;
+
+    const uint32_t stride = (uint32_t)compiz_w * 4;
+
+    uint32_t tex_y0;
+    if (compiz_flip) {
+        /* screen rows [y0, y0+band_h) -> texture rows mirrored */
+        for (uint32_t j = 0; j < band_h; j++) {
+            uint32_t sy = y0 + j;
+            uint32_t ty = (uint32_t)compiz_h - 1 - sy;
+            memcpy(compiz_stage + ty * compiz_w, src + sy * compiz_w, stride);
+        }
+        tex_y0 = (uint32_t)compiz_h - y0 - band_h;
+    } else {
+        memcpy(compiz_stage + y0 * compiz_w, src + y0 * compiz_w,
+               (uint32_t)band_h * stride);
+        tex_y0 = y0;
+    }
+
+    virtio_gpu_transfer_host_3d_t xfer;
+    memset(&xfer, 0, sizeof(xfer));
+    xfer.hdr.type   = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D;
+    xfer.hdr.ctx_id = vctx.ctx_id;
+    xfer.box.x = 0;
+    xfer.box.y = tex_y0;
+    xfer.box.z = 0;
+    xfer.box.w = compiz_w;
+    xfer.box.h = band_h;
+    xfer.box.d = 1;
+    xfer.offset       = (uint64_t)tex_y0 * stride;
+    xfer.resource_id  = compiz_tex_id;
+    xfer.level        = 0;
+    xfer.stride       = stride;
+    xfer.layer_stride = 0;
+    gpu3d_cmd_ok(&xfer, sizeof(xfer));
 }
 
 /*

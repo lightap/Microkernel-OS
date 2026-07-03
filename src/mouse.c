@@ -3,6 +3,12 @@
 #include "virtio_input.h"
 #include "serial.h"
 
+/* From virgl.c. Local prototypes instead of virgl.h: that header pulls
+ * <stdbool.h>, which clashes with the types.h `typedef int bool` used by
+ * the declarations in mouse.h. Both return 0/1 in eax either way. */
+extern int virgl_compiz_active(void);
+extern int virgl_compiz_get_flip(void);
+
 #define MOUSE_PORT   0x60
 #define MOUSE_CMD    0x64
 #define MOUSE_STATUS 0x64
@@ -13,7 +19,13 @@ static volatile uint8_t mouse_buttons = 0;
 static volatile uint8_t prev_buttons = 0;
 static volatile uint8_t packet[3];
 static volatile int      pkt_idx = 0;
-static volatile bool ps2_received = false;   /* true once PS/2 gets any data */
+static volatile bool ps2_received = false;   /* true once PS/2 gets any data
+    * NOTE: no longer used to demote virtio-input. The PS/2 init handshake
+    * emits ACK bytes at boot, which latched this true and permanently
+    * switched position reads to the PS/2 mouse — a device QEMU never sends
+    * motion to when a virtio-tablet is present (the tablet gets all pointer
+    * events). That froze the cursor. virtio-input, when active, is now
+    * authoritative. */
 static bool use_virtio_input = false;        /* true when virtio-input is active */
 
 static void mouse_wait_write(void) {
@@ -130,13 +142,18 @@ void mouse_poll(void) {
 }
 
 int  mouse_get_x(void) {
-    if (use_virtio_input && !ps2_received)
+    if (use_virtio_input)
         return virtio_input_get_x();
     return mx;
 }
 
 int  mouse_get_y(void) {
-    if (use_virtio_input && !ps2_received)
+    /* No flip-based inversion: QEMU maps tablet coordinates to the image
+     * as displayed, which our flip pipeline already makes match guest
+     * screen coordinates. (v12's "inverted mouse" was actually the
+     * correctly-positioned cursor rendered in a mirrored chrome layer —
+     * fixed in v13 — and the v13 inversion here then over-corrected.) */
+    if (use_virtio_input)
         return virtio_input_get_y();
     return my;
 }
@@ -151,25 +168,25 @@ void mouse_set_bounds(int max_x, int max_y) {
 }
 
 bool mouse_left_held(void) {
-    if (use_virtio_input && !ps2_received)
+    if (use_virtio_input)
         return virtio_input_left_held();
     return (mouse_buttons & 0x01) != 0;
 }
 
 bool mouse_right_held(void) {
-    if (use_virtio_input && !ps2_received)
+    if (use_virtio_input)
         return virtio_input_right_held();
     return (mouse_buttons & 0x02) != 0;
 }
 
 bool mouse_left_click(void) {
-    if (use_virtio_input && !ps2_received)
+    if (use_virtio_input)
         return virtio_input_left_click();
     return (mouse_buttons & 0x01) && !(prev_buttons & 0x01);
 }
 
 bool mouse_right_click(void) {
-    if (use_virtio_input && !ps2_received)
+    if (use_virtio_input)
         return virtio_input_right_click();
     return (mouse_buttons & 0x02) && !(prev_buttons & 0x02);
 }

@@ -380,7 +380,11 @@ void virtio_input_poll(void) {
         virtio_notify(&input_dev, EVENTQ);
     }
 
-    /* Periodic debug — logs every ~500 poll cycles */
+    /* Periodic debug — logs every ~500 poll cycles.
+     * Compiled out by default: serial_printf busy-waits on the UART, and at
+     * 38400 baud one of these lines stalls the whole system for ~14ms —
+     * enough to visibly tank the GUI frame rate while the mouse moves. */
+#ifdef VI_DEBUG
     debug_timer++;
     if (debug_timer >= 500) {
         debug_timer = 0;
@@ -388,6 +392,9 @@ void virtio_input_poll(void) {
                       vi_x, vi_y, vi_buttons, total_events,
                       vq->used->idx, vq->avail->idx);
     }
+#else
+    (void)debug_timer;
+#endif
 }
 
 int  virtio_input_get_x(void) { return vi_x; }

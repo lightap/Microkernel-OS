@@ -598,18 +598,55 @@ bool virtio_poll(virtio_dev_t* dev, uint16_t queue_idx) {
 /* ===== Wait for Completion (Busy Poll) ===== */
 // src/virtio.c (or wherever virtio_wait is)
 
+/* Perf instrumentation for the FPS reporter in syscall.c:
+ *  wait_fast  = waits resolved during the spin window (<= 2 ticks)
+ *  wait_slow  = waits that fell back to the yield/halt loop
+ *  wait_ticks = total timer ticks burned inside virtio_wait */
+uint32_t virtio_stat_wait_fast  = 0;
+uint32_t virtio_stat_wait_slow  = 0;
+uint32_t virtio_stat_wait_ticks = 0;
+
 void virtio_wait(virtio_dev_t* dev, uint16_t queue_idx) {
     uint32_t start_ticks = timer_get_ticks();
-    
-    // Wait for up to 50 ticks (500ms)
+
+    /* Interrupts must be on so the PIT keeps ticking while we spin.
+     * (task_yield() already does sti() in this same context.) */
+    sti();
+
+    /*
+     * Most virtio responses arrive within microseconds–milliseconds:
+     * QEMU processes the queue on its iothread as soon as we notify.
+     * The old code called task_yield() on every failed poll, and
+     * task_yield() halts until the next 100Hz timer tick — so EVERY
+     * poll iteration cost up to 10ms even when the response was ready
+     * 50µs later. With ~3 waits per 3D frame that alone capped the
+     * virgl path at well under 30 FPS.
+     *
+     * New strategy: spin-poll (with `pause`) for the first 2 ticks —
+     * this catches fast responses at their true latency — and only
+     * fall back to the yield/halt loop for genuinely slow operations.
+     */
     while (!virtio_poll(dev, queue_idx)) {
-        if (timer_get_ticks() - start_ticks > 50) {
+        uint32_t elapsed = timer_get_ticks() - start_ticks;
+
+        if (elapsed > 50) {
             serial_printf("virtio: TIMEOUT waiting on queue %u after 500ms\n", queue_idx);
             return;
         }
-        
-        // Let other tasks (like the GUI!) run while the GPU is busy
-        task_yield(); 
+
+        if (elapsed > 2) {
+            /* Slow operation — let other tasks run while the GPU works */
+            task_yield();
+        } else {
+            __asm__ volatile("pause");
+        }
+    }
+
+    {
+        uint32_t total = timer_get_ticks() - start_ticks;
+        virtio_stat_wait_ticks += total;
+        if (total > 2) virtio_stat_wait_slow++;
+        else           virtio_stat_wait_fast++;
     }
 }
 

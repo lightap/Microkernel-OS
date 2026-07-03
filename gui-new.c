@@ -21,7 +21,7 @@
 #include "pmm.h"
 #include "rtc.h"
 #include "virtio_gpu.h"
-#include "virgl.h"
+#include "virgl.h" 
 
 /* ====== CONSTANTS ====== */
 static uint16_t GFX_W = 1920;
@@ -180,8 +180,6 @@ static uint32_t* backbuf = NULL;
 static volatile uint32_t* framebuffer = NULL;
 static uint32_t fb_phys = 0;
 static bool using_virtio_gpu = false;  /* true when virtio-gpu is the backend */
-static bool compiz_mode = false;       /* true: desktop composited by the GPU (virgl) */
-static bool compiz_requested = false;  /* set by gui_start_compiz() before gui_start() */
 
 /* ====== FONT DATA (for text mode restore) ====== */
 static uint8_t font_data[128][16];
@@ -242,101 +240,13 @@ static void bga_disable(void) {
 }
 
 /* ====== BLIT ====== */
-static void compiz_build_scene(void);
-static uint32_t compiz_collect_rects(virgl_rect_t* r, uint32_t max);
-
 static void blit(void) {
-    if (using_virtio_gpu) {
-        /*
-         * virtio FB is regular RAM (identity-mapped) and still holds the
-         * previously presented frame, so we can diff against it to find
-         * the dirty row band. We then copy + TRANSFER_TO_HOST_2D + FLUSH
-         * only that band instead of the full 1920x1080x4 (~8 MB) frame.
-         * On an idle desktop this shrinks each present from two full-screen
-         * synchronous GPU round trips to a few rows (or nothing at all).
-         */
+  
+        /* virtio FB is regular RAM (identity-mapped) — memcpy is safe & fast */
         uint32_t* fb = virtio_gpu_get_fb();
-        const uint32_t row_bytes = GFX_W * sizeof(uint32_t);
-
-        int y0 = 0, y1 = GFX_H - 1;
-        while (y0 < GFX_H &&
-               memcmp(fb + (uint32_t)y0 * GFX_W,
-                      backbuf + (uint32_t)y0 * GFX_W, row_bytes) == 0)
-            y0++;
-
-        bool band_empty = (y0 == GFX_H);
-
-        /* GPU-scene compiz mode renders + composes EVERY frame — the GPU
-         * measured 600+ FPS on this pipe, and unconditional presents rule
-         * out every "stuck frame" class of damage-tracking bug. Only the
-         * content band upload stays damage-driven. */
-        bool scene_mode = compiz_mode && virgl_scene_available();
-
-        if (band_empty && !scene_mode)
-            return;                     /* nothing changed — skip present */
-
-        uint32_t band_h = 0;
-        if (!band_empty) {
-            while (y1 > y0 &&
-                   memcmp(fb + (uint32_t)y1 * GFX_W,
-                          backbuf + (uint32_t)y1 * GFX_W, row_bytes) == 0)
-                y1--;
-
-            band_h = (uint32_t)(y1 - y0 + 1);
-            memcpy(fb + (uint32_t)y0 * GFX_W,
-                   backbuf + (uint32_t)y0 * GFX_W,
-                   band_h * row_bytes);
-        }
-
-        if (compiz_mode) {
-            /*
-             * GPU-drawn desktop path:
-             *  1. refresh the dirty band of CPU content in the desktop tex
-             *  2. rebuild + render the chrome as GPU geometry (virgl draw)
-             *  3. compose chrome + CPU content rects to the display, flush
-             * Falls back to the plain texture present if the scene
-             * pipeline isn't available.
-             */
-            if (band_h)
-                virgl_compiz_upload_band(backbuf, (uint32_t)y0, band_h);
-            if (virgl_scene_available()) {
-                compiz_build_scene();
-                if (virgl_scene_flush()) {
-                    static virgl_rect_t rects[80];
-                    uint32_t n = compiz_collect_rects(rects, 80);
-                    virgl_compiz_compose(rects, n);
-                } else if (band_h) {
-                    virgl_compiz_present((uint32_t)y0, band_h);
-                }
-            } else if (band_h) {
-                virgl_compiz_present((uint32_t)y0, band_h);
-            }
-
-            /* compiz FPS on serial, once per second */
-            static uint32_t cfps_frames = 0, cfps_last = 0;
-            cfps_frames++;
-            uint32_t cnow = timer_get_ticks();
-            if (cnow - cfps_last >= 100) {
-                if (cfps_last)
-                    serial_printf("compiz: %u FPS (%s, flip=%u — press ` to toggle)\n",
-                                  (cfps_frames * 100) / (cnow - cfps_last),
-                                  virgl_scene_available() ? "GPU scene"
-                                                          : "texture",
-                                  virgl_compiz_get_flip() ? 1u : 0u);
-                cfps_frames = 0;
-                cfps_last = cnow;
-            }
-        } else {
-            virtio_gpu_flush(0, (uint32_t)y0, GFX_W, band_h);
-        }
-    } else {
-        /* BGA framebuffer is MMIO — must use volatile writes */
-        volatile uint32_t* dst = framebuffer;
-        uint32_t* src = backbuf;
-        int n = GFX_W * GFX_H;
-        for (int i = 0; i < n; i++)
-            dst[i] = src[i];
-    }
+        memcpy(fb, backbuf, GFX_W * GFX_H * sizeof(uint32_t));
+        virtio_gpu_flush_all();
+    
 }
 
 /* ====== DRAWING PRIMITIVES ====== */
@@ -612,6 +522,15 @@ static bool start_menu_open = false;
 static bool gui_running = true;
 static bool dragging = false;
 
+/* ====== DIRTY TRACKING ======
+ * Skip expensive full-screen redraws + 8MB blit when nothing changed.
+ * Mark dirty on: mouse movement, keyboard input, window changes, ELF frame updates.
+ */
+static bool needs_redraw = true;
+static int  prev_mouse_x = -1, prev_mouse_y = -1;
+
+static void gui_mark_dirty(void) { needs_redraw = true; }
+
 /* GL3D window rendering */
 #define GL_WIN_W 384
 #define GL_WIN_H 280
@@ -680,6 +599,7 @@ static int open_window(const char* title, int x, int y, int w, int h, app_type_t
     bring_to_front(idx);
     
     serial_printf("GUI: open_window complete, returning %d\n", focus_idx);
+    gui_mark_dirty();
     return focus_idx;
 }
 static void close_window(int idx) {
@@ -688,6 +608,7 @@ static void close_window(int idx) {
     focus_idx = -1;
     for (int i = MAX_WINDOWS - 1; i >= 0; i--)
         if (windows[i].active) { windows[i].focused = true; focus_idx = i; break; }
+    gui_mark_dirty();
 }
 
 /* ====== HELPERS ====== */
@@ -2041,40 +1962,10 @@ uint32_t gui_elf_win_open(uint32_t pid, uint32_t* page_dir, const char* title) {
     return ELF_GUI_FB_UVADDR;
 }
 
-/* Set to 1 if windowed GL content appears upside down on your host
- * (GL texture row order vs framebuffer row order can differ by driver). */
-#define ELF_GL_FLIP_Y 0
-
 static void draw_app_elf_gl(window_t* win) {
     int x = win->x + 6, y = win->y + TITLEBAR_H + 4;
     int cw = win->w - 12, ch = win->h - TITLEBAR_H - 8;
 
-    /* Windowed GL path (compiz): composite straight from the app's GPU
-     * readback buffer — its full-resolution rendered frame. */
-    uint16_t gw = 0, gh = 0;
-    uint32_t* gsrc = virgl_app_backing(&gw, &gh);
-    if (gsrc && gw && gh) {
-        for (int j = 0; j < (int)gh && j < ch; j++) {
-            int dy = y + j;
-            if ((unsigned)dy >= GFX_H) continue;
-#if ELF_GL_FLIP_Y
-            uint32_t* src_line = &gsrc[(gh - 1 - j) * gw];
-#else
-            uint32_t* src_line = &gsrc[j * gw];
-#endif
-            int x0 = x < 0 ? 0 : x;
-            int skip = x0 - x;
-            int n = (int)gw - skip;
-            if (n > cw - skip) n = cw - skip;
-            if (x0 + n > (int)GFX_W) n = (int)GFX_W - x0;
-            if (n <= 0) continue;
-            memcpy(&backbuf[dy * GFX_W + x0], &src_line[skip],
-                   (uint32_t)n * sizeof(uint32_t));
-        }
-        return;
-    }
-
-    // Find the shared buffer slot
     elf_gui_slot_t* slot = NULL;
     for (int i = 0; i < MAX_ELF_GUI; i++) {
         if (elf_gui_slots[i].active && elf_gui_slots[i].pid == win->elf_gl.owner_pid) {
@@ -2088,58 +1979,64 @@ static void draw_app_elf_gl(window_t* win) {
         return;
     }
 
-    // composition blit
     uint32_t* src_fb = slot->fb_kaddr;
-    for (int j = 0; j < ELF_GUI_FB_H && j < ch; j++) {
+    int src_w = ELF_GUI_FB_W;
+    int src_h = ELF_GUI_FB_H;
+
+    /* Check if virgl has a display backing — always prefer it over CPU fb */
+    uint32_t* virgl_backing = virgl_get_display_backing();
+    if (virgl_backing) {
+        src_fb = virgl_backing;
+        virgl_ctx_t* vctx = virgl_get_ctx();
+        if (vctx && vctx->fb_width > 0) {
+            src_w = vctx->fb_width;
+            src_h = vctx->fb_height;
+        }
+    }
+
+    /*
+     * Blit src_fb to window content area with nearest-neighbor scaling.
+     * GPU framebuffer may be larger than window (e.g. 640x400 → 320x200 window).
+     */
+    for (int j = 0; j < ch; j++) {
         int dy = y + j;
         if ((unsigned)dy >= GFX_H) continue;
-        
-        // Direct pointer access is faster and safer here
+
+        /* Map destination row to source row */
+        int src_y = (src_h > ch) ? (j * src_h / ch) : j;
+        if (src_y >= src_h) continue;
+
         uint32_t* dst_line = &backbuf[dy * GFX_W + x];
-        uint32_t* src_line = &src_fb[j * ELF_GUI_FB_W];
-        
-        for (int i = 0; i < ELF_GUI_FB_W && i < cw; i++) {
-            dst_line[i] = src_line[i];
+        uint32_t* src_line = &src_fb[src_y * src_w];
+
+        if (src_w <= cw) {
+            /* Source fits in window — direct copy */
+            for (int i = 0; i < src_w && i < cw; i++) {
+                dst_line[i] = src_line[i];
+            }
+        } else {
+            /* Source wider than window — scale down */
+            for (int i = 0; i < cw; i++) {
+                int src_x = i * src_w / cw;
+                if (src_x < src_w)
+                    dst_line[i] = src_line[src_x];
+            }
         }
     }
 }
 
 
 
-
-/* Resize the ELF app's window so its client area fits a w x h framebuffer
- * (used when a GL app inits its GPU surface under compiz). Margins match
- * draw_app_elf_gl: 6px sides, TITLEBAR_H+4 top, 4px bottom. */
-void gui_elf_win_resize(uint32_t pid, uint16_t w, uint16_t h) {
-    for (int i = 0; i < MAX_WINDOWS; i++) {
-        if (!windows[i].active || windows[i].app != APP_ELF_GL) continue;
-        if (windows[i].elf_gl.owner_pid != pid) continue;
-
-        windows[i].w = (int)w + 12;
-        windows[i].h = (int)h + TITLEBAR_H + 8;
-
-        /* Keep it on screen */
-        if (windows[i].w > (int)GFX_W) windows[i].w = GFX_W;
-        if (windows[i].h > (int)GFX_H - TASKBAR_H)
-            windows[i].h = GFX_H - TASKBAR_H;
-        if (windows[i].x + windows[i].w > (int)GFX_W)
-            windows[i].x = (int)GFX_W - windows[i].w;
-        if (windows[i].y + windows[i].h > (int)GFX_H - TASKBAR_H)
-            windows[i].y = (int)GFX_H - TASKBAR_H - windows[i].h;
-        if (windows[i].x < 0) windows[i].x = 0;
-        if (windows[i].y < 0) windows[i].y = 0;
-        return;
-    }
-}
-
 void gui_elf_win_present(uint32_t pid) {
     /*
-     * No-op. This used to task_yield(), but task_yield() halts until
-     * the next 100Hz timer tick — up to 10ms per present. While a
-     * virgl app owns the scanout the GUI is in standby anyway, and
-     * the preemptive scheduler handles fairness.
+     * The ELF app has finished rendering a frame via GPU3D.
+     * The virgl display backing now has fresh pixel data.
+     * Yield to let the GUI compositor run its render loop
+     * and pick up the new frame from the display backing.
      */
     (void)pid;
+    gui_mark_dirty();
+    task_yield();
 }
 
 void gui_elf_win_close(uint32_t pid) {
@@ -2193,25 +2090,9 @@ static void close_elf_gl_window(window_t* win) {
         slot->fb_kaddr = NULL;
         break;
     }
-    /* Kill the owning process — but first wait out any in-flight GPU
-     * submit it may be doing, so it can't die holding the submit lock. */
-    virgl_lock_gpu();
+    /* Kill the owning process */
     task_kill(pid);
-    virgl_unlock_gpu();
     serial_printf("GUI: killed ELF process PID %u (window closed)\n", pid);
-
-    if (virgl_app_windowed_active()) {
-        /* Windowed GL app under compiz: destroy just its sub-context.
-         * The compositor (and the desktop) keeps running untouched. */
-        virgl_app_windowed_end();
-    } else if (virgl_scanout_active()) {
-        /* Fullscreen GL app (classic mode): tear the 3D context down and
-         * give the display back to the 2D desktop. Without this the
-         * screen stays frozen on the app's last frame forever. */
-        virgl_shutdown();
-        if (using_virtio_gpu)
-            virtio_gpu_restore_scanout();
-    }
 }
 
 static void open_image_viewer(const char* filepath) {
@@ -2370,8 +2251,7 @@ static void draw_desktop(void) {
 
     if (wallpaper_loaded && wallpaper) {
         uint32_t n = (uint32_t)GFX_W * desk_h;
-        for (uint32_t i = 0; i < n; i++)
-            backbuf[i] = wallpaper[i];
+        memcpy(backbuf, wallpaper, n * sizeof(uint32_t));
         return;
     }
 
@@ -2732,350 +2612,9 @@ static void draw_start_menu(int hover) {
     draw_text(x + 10, bot_y + 11, "Log Off...", RGB(80, 80, 80));
 }
 
-/* ================================================================
- *  WOBBLY WINDOWS — the real thing.
- *
- *  Same model as compiz's wobbly plugin: each dragged window becomes a
- *  4x4 grid of mass points. Structural springs connect orthogonal
- *  neighbours (rest length = cell size) and every point has a weak
- *  spring to its "home" position in the rigid window rect. The grid
- *  point nearest the grab is pinned rigidly to the drag. Integration
- *  is semi-implicit Euler with friction, several substeps per frame.
- *  The window's ACTUAL PIXELS are then warped by the GPU: the mesh is
- *  drawn as textured triangles sampling the desktop texture (see the
- *  texturing fragment shader), so this is a true content deformation,
- *  not an overlay effect. After release the mesh keeps simulating
- *  until it settles back into the rigid rect.
- * ================================================================ */
-
-#define WOB_GRID 4
-#define WOB_PTS  (WOB_GRID * WOB_GRID)
-
-static struct {
-    bool  active;        /* simulating (dragging or settling) */
-    bool  grabbed;       /* still held by the mouse */
-    int   win;           /* window index */
-    int   grab;          /* pinned grid point index */
-    float px[WOB_PTS], py[WOB_PTS];   /* positions */
-    float vx[WOB_PTS], vy[WOB_PTS];   /* velocities */
-} wob = { false, false, -1, 0, {0}, {0}, {0}, {0} };
-
-/* Home position of grid point (gx,gy) for the window's current rect */
-static void wob_home(window_t* w, int gx, int gy, float* hx, float* hy) {
-    *hx = (float)w->x + (float)w->w * (float)gx / (WOB_GRID - 1);
-    *hy = (float)w->y + (float)w->h * (float)gy / (WOB_GRID - 1);
-}
-
-static void wob_start(int win_idx, int grab_screen_x, int grab_screen_y) {
-    window_t* w = &windows[win_idx];
-    wob.active  = true;
-    wob.grabbed = true;
-    wob.win     = win_idx;
-
-    float best = 1e30f;
-    for (int gy = 0; gy < WOB_GRID; gy++) {
-        for (int gx = 0; gx < WOB_GRID; gx++) {
-            int i = gy * WOB_GRID + gx;
-            float hx, hy;
-            wob_home(w, gx, gy, &hx, &hy);
-            wob.px[i] = hx;  wob.py[i] = hy;
-            wob.vx[i] = 0;   wob.vy[i] = 0;
-            float dx = hx - (float)grab_screen_x;
-            float dy = hy - (float)grab_screen_y;
-            float d  = dx * dx + dy * dy;
-            if (d < best) { best = d; wob.grab = i; }
-        }
-    }
-}
-
-/* One physics frame (called once per GUI tick while active) */
-static void wob_step(void) {
-    if (!wob.active) return;
-    window_t* w = &windows[wob.win];
-    if (!w->active) { wob.active = false; return; }
-
-    const float K_HOME   = 0.06f;   /* weak spring to rigid home     */
-    const float K_STRUCT = 0.28f;   /* structural neighbour springs  */
-    const float FRICTION = 0.86f;
-    const int   SUBSTEPS = 3;
-
-    float rest_x = (float)w->w / (WOB_GRID - 1);
-    float rest_y = (float)w->h / (WOB_GRID - 1);
-
-    for (int step = 0; step < SUBSTEPS; step++) {
-        for (int gy = 0; gy < WOB_GRID; gy++) {
-            for (int gx = 0; gx < WOB_GRID; gx++) {
-                int i = gy * WOB_GRID + gx;
-                float hx, hy;
-                wob_home(w, gx, gy, &hx, &hy);
-
-                if (wob.grabbed && i == wob.grab) {
-                    /* pinned rigidly to the drag */
-                    wob.px[i] = hx;  wob.py[i] = hy;
-                    wob.vx[i] = 0;   wob.vy[i] = 0;
-                    continue;
-                }
-
-                float fx = (hx - wob.px[i]) * K_HOME;
-                float fy = (hy - wob.py[i]) * K_HOME;
-
-                /* structural springs to orthogonal neighbours */
-                if (gx > 0) {
-                    int j = i - 1;
-                    fx += (wob.px[j] + rest_x - wob.px[i]) * K_STRUCT;
-                    fy += (wob.py[j]          - wob.py[i]) * K_STRUCT;
-                }
-                if (gx < WOB_GRID - 1) {
-                    int j = i + 1;
-                    fx += (wob.px[j] - rest_x - wob.px[i]) * K_STRUCT;
-                    fy += (wob.py[j]          - wob.py[i]) * K_STRUCT;
-                }
-                if (gy > 0) {
-                    int j = i - WOB_GRID;
-                    fx += (wob.px[j]          - wob.px[i]) * K_STRUCT;
-                    fy += (wob.py[j] + rest_y - wob.py[i]) * K_STRUCT;
-                }
-                if (gy < WOB_GRID - 1) {
-                    int j = i + WOB_GRID;
-                    fx += (wob.px[j]          - wob.px[i]) * K_STRUCT;
-                    fy += (wob.py[j] - rest_y - wob.py[i]) * K_STRUCT;
-                }
-
-                wob.vx[i] = (wob.vx[i] + fx) * FRICTION;
-                wob.vy[i] = (wob.vy[i] + fy) * FRICTION;
-                wob.px[i] += wob.vx[i];
-                wob.py[i] += wob.vy[i];
-            }
-        }
-    }
-
-    /* settled? (only after release) */
-    if (!wob.grabbed) {
-        float worst = 0;
-        for (int gy = 0; gy < WOB_GRID; gy++)
-            for (int gx = 0; gx < WOB_GRID; gx++) {
-                int i = gy * WOB_GRID + gx;
-                float hx, hy;
-                wob_home(w, gx, gy, &hx, &hy);
-                float dx = wob.px[i] - hx, dy = wob.py[i] - hy;
-                float d = dx * dx + dy * dy
-                        + wob.vx[i] * wob.vx[i] + wob.vy[i] * wob.vy[i];
-                if (d > worst) worst = d;
-            }
-        if (worst < 0.4f) wob.active = false;
-    }
-}
-
-/* Emit the warped window as GPU-textured triangles: mesh positions come
- * from the spring model, texel coords from the rigid rect (where the
- * CPU drew the window into the desktop texture this frame). */
-static void wob_emit_scene(void) {
-    if (!wob.active) return;
-    window_t* w = &windows[wob.win];
-    if (!w->active) return;
-
-    for (int gy = 0; gy < WOB_GRID - 1; gy++) {
-        for (int gx = 0; gx < WOB_GRID - 1; gx++) {
-            int i00 = gy * WOB_GRID + gx;
-            int i10 = i00 + 1;
-            int i01 = i00 + WOB_GRID;
-            int i11 = i01 + 1;
-            float t00x, t00y, t10x, t10y, t01x, t01y, t11x, t11y;
-            wob_home(w, gx,     gy,     &t00x, &t00y);
-            wob_home(w, gx + 1, gy,     &t10x, &t10y);
-            wob_home(w, gx,     gy + 1, &t01x, &t01y);
-            wob_home(w, gx + 1, gy + 1, &t11x, &t11y);
-
-            virgl_scene_tex_tri(wob.px[i00], wob.py[i00], t00x, t00y,
-                                wob.px[i10], wob.py[i10], t10x, t10y,
-                                wob.px[i11], wob.py[i11], t11x, t11y);
-            virgl_scene_tex_tri(wob.px[i00], wob.py[i00], t00x, t00y,
-                                wob.px[i11], wob.py[i11], t11x, t11y,
-                                wob.px[i01], wob.py[i01], t01x, t01y);
-        }
-    }
-}
-
-
-/* ================================================================
- *  compiz GPU SCENE — the desktop drawn BY the GPU
- *
- *  Every frame the desktop chrome is rebuilt as triangle geometry and
- *  rendered by the host GPU via virgl: background gradient, window
- *  shadows/borders/bodies, titlebar gradients with GPU-drawn title
- *  text (VGA font glyphs decomposed into merged rectangles), close
- *  buttons, taskbar gradient and the mouse cursor. Text-dense dynamic
- *  content (window client areas, the taskbar strip, the start menu)
- *  stays CPU-rendered and is composited on top as opaque rectangles
- *  from the desktop texture — same approach early GPU compositors
- *  used for legacy content.
- * ================================================================ */
-
-/* Draw a string as GPU quads: each glyph's 8x16 bitmap is decomposed
- * into rectangles (identical consecutive rows merged vertically, set
- * bits merged horizontally) — a typical glyph is ~6-12 quads. */
-static void scene_text(int x, int y, const char* s, uint32_t col) {
-    for (; *s; s++, x += 8) {
-        unsigned char c = (unsigned char)*s & 0x7F;
-        int r = 0;
-        while (r < 16) {
-            uint8_t bits = font_data[c][r];
-            int rh = 1;
-            while (r + rh < 16 && font_data[c][r + rh] == bits) rh++;
-            if (bits) {
-                int i = 0;
-                while (i < 8) {
-                    if (bits & (0x80 >> i)) {
-                        int len = 1;
-                        while (i + len < 8 && (bits & (0x80 >> (i + len)))) len++;
-                        virgl_scene_quad(x + i, y + r, len, rh, col);
-                        i += len;
-                    } else {
-                        i++;
-                    }
-                }
-            }
-            r += rh;
-        }
-    }
-}
-
-/* Rebuild the desktop chrome as GPU geometry for this frame */
-static void compiz_build_scene(void) {
-    virgl_scene_begin();
-
-    /* Desktop background: one gradient quad, interpolated by the GPU */
-    virgl_scene_quad4(0, 0, GFX_W, GFX_H,
-                      COL_DESKTOP_TOP, COL_DESKTOP_TOP,
-                      COL_DESKTOP_BOT, COL_DESKTOP_BOT);
-
-    /* Windows, bottom-to-top (same order as the CPU renderer) */
-    for (int wi = 0; wi < MAX_WINDOWS; wi++) {
-        window_t* win = &windows[wi];
-        if (!win->active) continue;
-        int x = win->x, y = win->y, w = win->w, h = win->h;
-
-        /* Drop shadow (solid — no blend state in the pipeline yet) */
-        virgl_scene_quad(x + 4, y + 4, w, h, RGB(18, 48, 92));
-
-        /* Outer border block + body */
-        uint32_t border = win->focused ? COL_WINBORDER_OUT : COL_IBORDER_OUT;
-        virgl_scene_quad(x, y, w, h, border);
-        virgl_scene_quad(x + 2, y + 3, w - 4, h - 6, COL_WINBODY);
-
-        /* Titlebar: XP 4-stop gradient approximated as two GPU bands */
-        int tb_x = x + 2, tb_y = y + 3, tb_w = w - 4;
-        int half = TITLEBAR_H / 2;
-        if (win->focused) {
-            virgl_scene_quad4(tb_x, tb_y, tb_w, half,
-                              COL_TITLE_T1, COL_TITLE_T1,
-                              COL_TITLE_T2, COL_TITLE_T2);
-            virgl_scene_quad4(tb_x, tb_y + half, tb_w, TITLEBAR_H - half,
-                              COL_TITLE_T3, COL_TITLE_T3,
-                              COL_TITLE_T4, COL_TITLE_T4);
-            virgl_scene_quad(tb_x + 1, tb_y, tb_w - 2, 1, COL_TITLE_SHINE);
-        } else {
-            virgl_scene_quad4(tb_x, tb_y, tb_w, half,
-                              COL_ITITLE_T1, COL_ITITLE_T1,
-                              COL_ITITLE_T2, COL_ITITLE_T2);
-            virgl_scene_quad4(tb_x, tb_y + half, tb_w, TITLEBAR_H - half,
-                              COL_ITITLE_T3, COL_ITITLE_T3,
-                              COL_ITITLE_T4, COL_ITITLE_T4);
-        }
-
-        /* GPU-drawn title text (skip if the vertex budget runs low) */
-        if (virgl_scene_free_verts() > 3000)
-            scene_text(x + 10, y + 9, win->title,
-                       win->focused ? COL_TITLETXT : COL_ITITLETXT);
-
-        /* Close button: gradient quad + GPU-drawn X */
-        int btn_w = 21, btn_h = 16;
-        int cbx = x + w - btn_w - 6, cby = y + 6;
-        virgl_scene_quad4(cbx, cby, btn_w, btn_h,
-                          COL_CLOSE_TOP, COL_CLOSE_TOP,
-                          COL_CLOSE_BOT, COL_CLOSE_BOT);
-        if (virgl_scene_free_verts() > 200)
-            scene_text(cbx + 6, cby, "x", COL_WHITE);
-    }
-
-    /* Taskbar gradient (labels/clock composited on top from CPU) */
-    virgl_scene_quad4(0, GFX_H - TASKBAR_H, GFX_W, TASKBAR_H,
-                      COL_TASKBAR_TOP, COL_TASKBAR_TOP,
-                      COL_TASKBAR_BOT, COL_TASKBAR_BOT);
-
-    /* Wobbly window: warped textured mesh over the chrome */
-    wob_step();
-    wob_emit_scene();
-
-    /* Cursor: GPU triangles (black outline + white arrow) */
-    int mx = mouse_get_x(), my = mouse_get_y();
-    virgl_scene_tri(mx, my, mx, my + 17, mx + 12, my + 12, RGB(0, 0, 0));
-    virgl_scene_tri(mx + 1, my + 3, mx + 1, my + 14, mx + 9, my + 10,
-                    RGB(255, 255, 255));
-}
-
-/* Collect this frame's composite list: per window, its CPU content
- * followed by its GPU frame ring, in stacking order; then the CPU
- * taskbar strip and (if open) the start menu on top. */
-static uint32_t compiz_collect_rects(virgl_rect_t* r, uint32_t max) {
-    uint32_t n = 0;
-    for (int wi = 0; wi < MAX_WINDOWS && n + 5 < max; wi++) {
-        window_t* win = &windows[wi];
-        if (!win->active) continue;
-        /* Wobbling window: its warped mesh (drawn in the chrome layer,
-         * sampling this window's pixels from the desktop texture)
-         * replaces the rigid content + frame rects entirely. */
-        if (wob.active && wob.win == wi) continue;
-        int x = win->x, y = win->y, w = win->w, h = win->h;
-
-        /* CPU content: the interior below the titlebar */
-        r[n++] = (virgl_rect_t){ x + 2, y + 3 + TITLEBAR_H,
-                                 w - 4, h - 6 - TITLEBAR_H, 0 };
-        /* GPU chrome ring back on top (keeps stacking right when this
-         * window overlaps an earlier window's content) */
-        r[n++] = (virgl_rect_t){ x, y, w, 3 + TITLEBAR_H, 1 };  /* top+titlebar */
-        r[n++] = (virgl_rect_t){ x, y + h - 3, w, 3, 1 };       /* bottom */
-        r[n++] = (virgl_rect_t){ x, y, 2, h, 1 };               /* left */
-        r[n++] = (virgl_rect_t){ x + w - 2, y, 2, h, 1 };       /* right */
-    }
-    if (n < max)  /* taskbar: text-heavy, CPU-rendered, always on top */
-        r[n++] = (virgl_rect_t){ 0, GFX_H - TASKBAR_H, GFX_W, TASKBAR_H, 0 };
-    if (start_menu_open && n < max)
-        r[n++] = (virgl_rect_t){ SM_X, SM_Y, SM_W, SM_H, 0 };
-    /* No cursor rect: the GPU cursor lives in the chrome layer, and the
-     * CPU cursor is drawn into the backbuffer so content regions carry
-     * their own cursor pixels — visible everywhere, no box artifacts. */
-    return n;
-}
-
-/* Clean up any ELF GL windows whose owning process has died.
- * Called from render(), and also from the main loop's 3D-standby path
- * (where render() is skipped) so a crashed/exited GL app still gets
- * reaped and the display handed back to the desktop. */
-static void reap_dead_elf_windows(void) {
-    for (int i = 0; i < MAX_WINDOWS; i++) {
-        if (windows[i].active && windows[i].app == APP_ELF_GL) {
-            task_t* owner = task_get_by_pid(windows[i].elf_gl.owner_pid);
-            if (!owner || !owner->active || owner->state == TASK_TERMINATED) {
-                close_elf_gl_window(&windows[i]);
-                close_window(i);
-                i--; /* re-check this slot */
-            }
-        }
-    }
-}
-
 /* ====== RENDER ====== */
-/* True when the GPU draws the desktop chrome (background, frames, cursor)
- * — the CPU then only renders content regions (window interiors, taskbar,
- * menus), which massively shrinks per-frame CPU work and dirty bands. */
-static bool compiz_scene_on(void) {
-    return compiz_mode && virgl_scene_available();
-}
-
 void render(void) {
-    if (!compiz_scene_on())
-        draw_desktop();
+    draw_desktop();
     for (int i = 0; i < MAX_WINDOWS; i++) {
         if (!windows[i].active) continue;
         draw_window(&windows[i]);
@@ -3114,20 +2653,24 @@ void render(void) {
     }
 
     /* Clean up any ELF GL windows whose owning process has died */
-    reap_dead_elf_windows();
-
-    if (!compiz_scene_on()) {
-        static int heart = 0;
-        heart++;
-        // Draw a small flashing square in the bottom right tray area
-        fill_rect(GFX_W - 15, GFX_H - 15, 10, 10,
-                  (heart % 20 < 10) ? RGB(255,0,0) : RGB(0,255,0));
-        // --- END HEARTBEAT ---
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        if (windows[i].active && windows[i].app == APP_ELF_GL) {
+            task_t* owner = task_get_by_pid(windows[i].elf_gl.owner_pid);
+            if (!owner || !owner->active || owner->state == TASK_TERMINATED) {
+                close_elf_gl_window(&windows[i]);
+                close_window(i);
+                i--; /* re-check this slot */
+            }
+        }
     }
-    /* Cursor is always CPU-drawn into the backbuffer: in GPU-scene mode
-     * the content rects (window interiors, taskbar, menu) composite over
-     * the chrome, so they must carry their own cursor pixels. The GPU
-     * also draws a cursor in the chrome layer at the same position. */
+
+    draw_cursor(mouse_get_x(), mouse_get_y());
+     static int heart = 0;
+    heart++;
+    // Draw a small flashing square in the bottom right tray area
+    fill_rect(GFX_W - 15, GFX_H - 15, 10, 10, (heart % 20 < 10) ? RGB(255,0,0) : RGB(0,255,0));
+    // --- END HEARTBEAT ---
+
     draw_cursor(mouse_get_x(), mouse_get_y());
     blit();
 }
@@ -3179,13 +2722,12 @@ static void handle_mouse(void) {
             if (windows[drag_idx].y < 0) windows[drag_idx].y = 0;
             if (windows[drag_idx].y > GFX_H - TASKBAR_H - TITLEBAR_H)
                 windows[drag_idx].y = GFX_H - TASKBAR_H - TITLEBAR_H;
-        } else {
-            dragging = false; drag_idx = -1;
-            wob.grabbed = false;   /* released: mesh springs back */
-        }
+            gui_mark_dirty();
+        } else { dragging = false; drag_idx = -1; gui_mark_dirty(); }
         return;
     }
     if (!lclick) return;
+    gui_mark_dirty();  /* Any click causes a visual change */
     if (start_menu_open) { handle_start_click(mx, my); return; }
     if (my >= GFX_H - TASKBAR_H) {
         if (mx >= 2 && mx < 2 + START_BTN_W && my >= GFX_H - TASKBAR_H + 3) {
@@ -3212,13 +2754,7 @@ static void handle_mouse(void) {
             if (win->app == APP_ELF_GL) close_elf_gl_window(win);
             close_window(ni); return;
         }
-        if (ry < TITLEBAR_H + 3) {
-            dragging = true; drag_idx = ni; drag_ox = rx; drag_oy = ry;
-            if (compiz_mode && virgl_scene_available() &&
-                virgl_pipeline_fs_tex() != 0)
-                wob_start(ni, mx, my);
-            return;
-        }
+        if (ry < TITLEBAR_H + 3) { dragging = true; drag_idx = ni; drag_ox = rx; drag_oy = ry; return; }
         switch (win->app) {
             case APP_ABOUT: click_about(win, rx, ry); break;
             case APP_CALC:  click_calc(win, rx, ry); break;
@@ -3233,24 +2769,9 @@ static void handle_mouse(void) {
 
 static void handle_keyboard(void) {
     if (!keyboard_haskey()) return;
+    gui_mark_dirty();  /* Any keystroke causes a visual change */
     char key = keyboard_getchar();
-    serial_printf("gui: key=%d '%c' focus=%d\n",
-                  (int)(unsigned char)key,
-                  (key >= 32 && key < 127) ? key : '?', focus_idx);
     if (key == 27) { if (start_menu_open) start_menu_open = false; return; }
-    if (key == '`' && compiz_mode) {
-        /* Live display-orientation toggle (host GL scanout conventions
-         * vary; this fixes upside-down output with one keypress). */
-        virgl_compiz_set_flip(!virgl_compiz_get_flip());
-        serial_printf("compiz: flip toggled -> %u\n",
-                      virgl_compiz_get_flip() ? 1u : 0u);
-        /* Force a full content re-upload in the new orientation */
-        uint32_t* fb = using_virtio_gpu ? virtio_gpu_get_fb() : NULL;
-        if (fb && backbuf) {
-            memset(fb, 0xFF, (uint32_t)GFX_W * GFX_H * 4);  /* poison shadow */
-        }
-        return;
-    }
     if (focus_idx >= 0 && windows[focus_idx].active) {
         window_t* win = &windows[focus_idx];
         switch (win->app) {
@@ -3357,29 +2878,6 @@ void gui_start(void) {
     bool have_bga = bga_detect();
     bool have_virtio = false;
 
-    /*
-     * compiz REQUIRES the virtio-gpu(-gl) backend. QEMU adds a default
-     * std VGA unless you pass -vga none, so with "-device
-     * virtio-gpu-gl-pci" the guest often sees TWO adapters — and the
-     * BGA/VGA probe above would win, silently putting the desktop on
-     * the VGA display while hello.elf ran on the virtio-gpu one.
-     * Force the virtio backend whenever compiz was requested.
-     */
-    if (compiz_requested) {
-        if (!virtio_gpu_available()) {
-            kprintf("compiz: no virtio-gpu found. Boot QEMU with:\n");
-            kprintf("  -device virtio-gpu-gl-pci -display gtk,gl=on -vga none\n");
-            return;
-        }
-        if (have_bga) {
-            kprintf("compiz: ignoring VGA/BGA adapter — using virtio-gpu-gl.\n");
-            kprintf("compiz: tip: add '-vga none' to QEMU so only the\n");
-            kprintf("        virtio-gpu display window exists.\n");
-            bga_disable();       /* blank the stale VGA scanout */
-            have_bga = false;    /* take the virtio branch below */
-        }
-    }
-
     if (!have_bga) {
         /* Try virtio-gpu as fallback */
         have_virtio = virtio_gpu_available();
@@ -3419,15 +2917,7 @@ void gui_start(void) {
         return;
     }
 
-    if (have_bga) {
-        /* BGA backend */
-        using_virtio_gpu = false;
-        if (!bga_init_mode(GFX_W, GFX_H, 32)) {
-            kprintf("GUI: Failed to set %ux%ux32 mode.\n", GFX_W, GFX_H);
-            kfree(backbuf); backbuf = NULL;
-            return;
-        }
-    } else {
+  
         /* VirtIO-GPU backend */
         using_virtio_gpu = true;
         if (!virtio_gpu_set_mode(GFX_W, GFX_H)) {
@@ -3437,18 +2927,7 @@ void gui_start(void) {
         }
         /* Point framebuffer at the virtio-gpu FB (for any code that reads it directly) */
         framebuffer = (volatile uint32_t*)virtio_gpu_get_fb();
-
-        /* compiz: bring up the virgl GPU compositor on top */
-        compiz_mode = false;
-        if (compiz_requested) {
-            if (virgl_compiz_init(GFX_W, GFX_H, backbuf)) {
-                compiz_mode = true;
-                kprintf("GUI: compiz mode — desktop composited by the GPU (virgl)\n");
-            } else {
-                kprintf("GUI: compiz init failed, falling back to 2D compositor\n");
-            }
-        }
-    }
+    
 
     mouse_init();
     mouse_set_bounds(GFX_W - 1, GFX_H - 1);
@@ -3460,47 +2939,46 @@ void gui_start(void) {
     gui_running = true;
     dragging = false;
     start_btn_hover = false;
+    needs_redraw = true;
+    prev_mouse_x = -1;
+    prev_mouse_y = -1;
 
     load_wallpaper();
 
-    /* Drain any stale keystrokes buffered during boot/shell (typing
-     * 'compiz' + Enter can leave bytes behind that would land in the
-     * first focused window as garbage). */
-    while (keyboard_haskey()) (void)keyboard_getchar();
-
     while (gui_running) {
-        /*
-         * If a virgl 3D app owns scanout 0 (hello.elf etc.), the desktop
-         * is not visible: virgl issued its own SET_SCANOUT at init.
-         * Repainting 1920x1080 in software + doing GPU transfer/flush
-         * round-trips for an invisible desktop just steals nearly all
-         * CPU from the 3D app. Stand by instead: keep input + window
-         * reaping alive, skip render/blit entirely.
-         */
-        if (using_virtio_gpu && virgl_scanout_active() && !compiz_mode) {
-            mouse_poll();
-            handle_keyboard();
-            reap_dead_elf_windows();
-            task_sleep(2);
-            continue;
+        mouse_poll();
+
+        /* Check if mouse moved — if so, must redraw (cursor position changed) */
+        {
+            int mx = mouse_get_x(), my = mouse_get_y();
+            if (mx != prev_mouse_x || my != prev_mouse_y) {
+                prev_mouse_x = mx;
+                prev_mouse_y = my;
+                gui_mark_dirty();
+            }
         }
 
-        mouse_poll();
         handle_mouse();
         handle_keyboard();
-        render();
 
-        /* 1 tick @ 100Hz = up to ~100 FPS pacing (was 10 ticks = hard 10 FPS cap) */
-        task_sleep(1);
+        /* Active ELF GL windows are continuously animating — always redraw */
+        for (int i = 0; i < MAX_WINDOWS; i++) {
+            if (windows[i].active && windows[i].app == APP_ELF_GL) {
+                gui_mark_dirty();
+                break;
+            }
+        }
+
+        /* Only redraw + blit when something actually changed */
+        if (needs_redraw) {
+            render();
+            needs_redraw = false;
+        }
+
+        task_sleep(10);
     }
 
     mouse_set_bounds(319, 199);
-
-    if (compiz_mode) {
-        virgl_compiz_shutdown();
-        compiz_mode = false;
-    }
-    compiz_requested = false;
 
     if (using_virtio_gpu) {
         virtio_gpu_disable();
@@ -3515,18 +2993,4 @@ void gui_start(void) {
     if (backbuf) { kfree(backbuf); backbuf = NULL; }
 
 
-}
-/* ====== COMPIZ ENTRY POINT ====== */
-/* Same desktop, but composited by the GPU through the virgl 3D driver:
- * the desktop backbuffer backs a GPU texture; dirty bands are DMA'd to it
- * and composited to the display resource host-side. Requires the
- * virtio-gpu backend (-device virtio-gpu-gl-pci -display ...,gl=on). */
-void gui_start_compiz(void) {
-    if (!virtio_gpu_available()) {
-        kprintf("compiz: needs virtio-gpu (-device virtio-gpu-gl-pci, gl=on)\n");
-        return;
-    }
-    compiz_requested = true;
-    gui_start();
-    compiz_requested = false;
 }

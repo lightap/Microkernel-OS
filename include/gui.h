@@ -4,6 +4,7 @@
 #include "types.h"
 
 void gui_start(void);
+void gui_start_compiz(void);
 
 /* ---- ELF process GUI window support ---- */
 
@@ -23,6 +24,12 @@ uint32_t gui_elf_win_open(uint32_t pid, uint32_t* page_dir, const char* title);
  * Present the framebuffer (no-op, buffer is read each frame).
  */
 void gui_elf_win_present(uint32_t pid);
+
+/*
+ * Resize the window owned by PID to fit a w x h client framebuffer
+ * (used by windowed GL apps under compiz).
+ */
+void gui_elf_win_resize(uint32_t pid, uint16_t w, uint16_t h);
 
 /*
  * Close the GUI window owned by the given PID.

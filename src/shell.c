@@ -1254,6 +1254,17 @@ static void cmd_gui(int ac, char** av) {
     kprintf("Returned to console.\n");
 }
 
+static void cmd_compiz(int ac, char** av) {
+    bool wobble = (ac > 1 && av[1] && av[1][0] == 'w');
+    virgl_compiz_enable_texturing(wobble);
+    kprintf("Starting GPU-composited desktop (virgl)%s...\n",
+            wobble ? " + wobbly windows" : "");
+    gui_start_compiz();
+    virgl_compiz_enable_texturing(false);
+    terminal_clear();
+    kprintf("Returned to console.\n");
+}
+
 static void cmd_sh(int argc, char** argv) {
     if(argc<2){kprintf("Usage: sh <script>\n");return;}
     char buf[RAMFS_MAX_DATA]; int32_t n=ramfs_read(argv[1],buf,sizeof(buf)-1);
@@ -1377,7 +1388,7 @@ static const command_t commands[] = {
     {"beep",cmd_beep},{"color",cmd_color},{"calc",cmd_calc},{"history",cmd_history},{"logo",cmd_logo},
     {"snake",cmd_snake},{"2048",cmd_2048},
     {"matrix",cmd_matrix},{"starfield",cmd_starfield},{"pipes",cmd_pipes},
-    {"gui",cmd_gui},{"startx",cmd_gui},{"desktop",cmd_gui},
+    {"gui",cmd_gui},{"startx",cmd_gui},{"desktop",cmd_gui},{"compiz",cmd_compiz},
     {"gl",cmd_gl},{"opengl",cmd_gl},{"3d",cmd_gl},{"gldemo",cmd_gl},
     {"sh",cmd_sh},{"run",cmd_sh},
     {NULL,NULL}

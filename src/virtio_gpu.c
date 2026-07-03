@@ -240,40 +240,38 @@ static uint32_t* alloc_framebuffer(uint32_t size) {
     uint32_t num_pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
     serial_printf("virtio-gpu: allocating %u pages for framebuffer\n", num_pages);
 
-    /* Try to allocate contiguous pages from PMM */
+    /*
+     * Allocate pages one at a time and verify contiguity as we go (the
+     * PMM bitmap allocator hands out sequential pages). Because the run
+     * is contiguous by construction, we only need to remember its start
+     * — no fixed-size pointer array, so NO size cap (the old 1024-entry
+     * array limited framebuffers to 4MB; 1920x1080x32 needs 8.3MB).
+     */
     uint32_t first_page = 0;
 
-    /*
-     * Strategy: allocate pages one at a time and hope they're contiguous.
-     * PMM bitmap allocator tends to give sequential pages. We verify
-     * contiguity and fall back to kmalloc if needed.
-     */
-    void* pages[1024];  /* Max ~4MB framebuffer */
-    if (num_pages > 1024) {
-        serial_printf("virtio-gpu: framebuffer too large\n");
-        return NULL;
-    }
-
     for (uint32_t i = 0; i < num_pages; i++) {
-        pages[i] = pmm_alloc_page();
-        if (!pages[i]) {
-            /* Free what we got */
-            for (uint32_t j = 0; j < i; j++) pmm_free_page(pages[j]);
+        void* p = pmm_alloc_page();
+        if (!p) {
+            for (uint32_t j = 0; j < i; j++)
+                pmm_free_page((void*)(first_page + j * PAGE_SIZE));
             serial_printf("virtio-gpu: out of memory for FB\n");
             return NULL;
         }
         if (i == 0) {
-            first_page = (uint32_t)pages[0];
-        } else if ((uint32_t)pages[i] != first_page + i * PAGE_SIZE) {
+            first_page = (uint32_t)p;
+        } else if ((uint32_t)p != first_page + i * PAGE_SIZE) {
             /* Not contiguous - this is a problem for DMA.
              * Free everything and use kmalloc instead. */
             serial_printf("virtio-gpu: non-contiguous pages, using kmalloc\n");
-            for (uint32_t j = 0; j <= i; j++) pmm_free_page(pages[j]);
+            for (uint32_t j = 0; j < i; j++)
+                pmm_free_page((void*)(first_page + j * PAGE_SIZE));
+            pmm_free_page(p);
 
             /* kmalloc with page alignment */
             uint8_t* buf = (uint8_t*)kmalloc(size + PAGE_SIZE);
             if (!buf) return NULL;
             buf = (uint8_t*)(((uint32_t)buf + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1));
+            memset(buf, 0, size);
             return (uint32_t*)buf;
         }
     }
@@ -525,6 +523,16 @@ void virtio_gpu_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
 
 void virtio_gpu_flush_all(void) {
     virtio_gpu_flush(0, 0, gpu_width, gpu_height);
+}
+
+/* Re-claim scanout 0 for the 2D framebuffer resource. Needed after a virgl
+ * 3D app (which issues its own SET_SCANOUT) exits — nothing else ever gives
+ * the display back to the desktop. */
+void virtio_gpu_restore_scanout(void) {
+    if (!gpu_initialized || !gpu_active_resource) return;
+    gpu_set_scanout(0, gpu_active_resource, gpu_width, gpu_height);
+    gpu_transfer(gpu_active_resource, 0, 0, gpu_width, gpu_height);
+    gpu_flush_resource(gpu_active_resource, 0, 0, gpu_width, gpu_height);
 }
 
 void virtio_gpu_disable(void) {
